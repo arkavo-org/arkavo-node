@@ -5,7 +5,7 @@ mod payment_integration {
     use ink::prelude::string::String;
     use ink::storage::Mapping;
 
-    /// Maximum length for string inputs (payment_provider, transaction_id)
+    /// Maximum length for string inputs (`payment_provider`, `transaction_id`)
     const MAX_STRING_LENGTH: usize = 256;
 
     /// Payment status
@@ -23,7 +23,7 @@ mod payment_integration {
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout))]
     pub struct Payment {
         pub account: Address,
-        pub payment_provider: String, // "apple", "google", etc.
+        pub provider: String, // "apple", "google", etc.
         pub transaction_id: String,
         pub amount: Balance,
         pub entitlement_granted: u8, // Entitlement level granted
@@ -161,7 +161,7 @@ mod payment_integration {
         pub fn record_payment(
             &mut self,
             account: Address,
-            payment_provider: String,
+            provider: String,
             transaction_id: String,
             amount: Balance,
             entitlement_granted: u8,
@@ -171,9 +171,7 @@ mod payment_integration {
             }
 
             // Validate input lengths
-            if payment_provider.len() > MAX_STRING_LENGTH
-                || transaction_id.len() > MAX_STRING_LENGTH
-            {
+            if provider.len() > MAX_STRING_LENGTH || transaction_id.len() > MAX_STRING_LENGTH {
                 return Err(Error::InputTooLong);
             }
 
@@ -187,7 +185,7 @@ mod payment_integration {
 
             let payment = Payment {
                 account,
-                payment_provider: payment_provider.clone(),
+                provider: provider.clone(),
                 transaction_id: transaction_id.clone(),
                 amount,
                 entitlement_granted,
@@ -202,7 +200,7 @@ mod payment_integration {
             self.env().emit_event(PaymentRecorded {
                 payment_id,
                 account,
-                payment_provider,
+                payment_provider: provider,
                 transaction_id,
                 amount,
             });
@@ -211,7 +209,7 @@ mod payment_integration {
         }
 
         /// Complete a payment and grant entitlement
-        /// In a real implementation, this would call the access_registry contract
+        /// In a real implementation, this would call the `access_registry` contract
         #[ink(message)]
         pub fn complete_payment(&mut self, payment_id: u32) -> Result<()> {
             if !self.is_authorized_processor(self.env().caller()) {

@@ -6,7 +6,7 @@ mod policy_engine {
     use ink::prelude::vec::Vec;
     use ink::storage::Mapping;
 
-    /// Maximum length for string inputs (resource_id, attribute keys/values)
+    /// Maximum length for string inputs (`resource_id`, attribute keys/values)
     const MAX_STRING_LENGTH: usize = 256;
     /// Maximum number of required attributes in a policy
     const MAX_ATTRIBUTES: usize = 50;
@@ -237,8 +237,8 @@ mod policy_engine {
         }
 
         /// Evaluate access for an account against a policy
-        /// Note: In a real implementation, this would call the access_registry
-        /// and attribute_store contracts. For now, it's a simplified version.
+        /// Note: In a real implementation, this would call the `access_registry`
+        /// and `attribute_store` contracts. For now, it's a simplified version.
         #[ink(message)]
         pub fn evaluate_access(&self, account: Address, policy_id: u32) -> bool {
             if let Some(policy) = self.policies.get(policy_id) {

@@ -163,7 +163,7 @@ mod attribute_store {
 
         /// Authorize a writer to set attributes for an account
         #[ink(message)]
-        pub fn authorize_writer(&mut self, writer: Address) -> Result<()> {
+        pub fn authorize_writer(&mut self, writer: Address) {
             let caller = self.env().caller();
             self.authorized_writers.insert((caller, writer), &true);
 
@@ -171,13 +171,11 @@ mod attribute_store {
                 account: caller,
                 writer,
             });
-
-            Ok(())
         }
 
         /// Revoke a writer's authorization
         #[ink(message)]
-        pub fn revoke_writer(&mut self, writer: Address) -> Result<()> {
+        pub fn revoke_writer(&mut self, writer: Address) {
             let caller = self.env().caller();
             self.authorized_writers.remove((caller, writer));
 
@@ -185,8 +183,6 @@ mod attribute_store {
                 account: caller,
                 writer,
             });
-
-            Ok(())
         }
 
         /// Check if a caller can write attributes for an account
@@ -275,7 +271,7 @@ mod attribute_store {
             let account = Address::from([0x01; 20]);
             let writer = Address::from([0x02; 20]);
 
-            assert!(contract.authorize_writer(writer).is_ok());
+            contract.authorize_writer(writer);
             assert!(contract.can_write(writer, account));
         }
     }

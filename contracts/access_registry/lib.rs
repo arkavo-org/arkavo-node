@@ -5,7 +5,7 @@ mod access_registry {
     use ink::storage::Mapping;
 
     /// Defines entitlement levels for access control
-    #[derive(Default, Debug, PartialEq, Eq, Clone, scale::Encode, scale::Decode)]
+    #[derive(Default, Debug, PartialEq, Eq, Clone, Copy, scale::Encode, scale::Decode)]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout))]
     pub enum EntitlementLevel {
         #[default]
@@ -81,7 +81,7 @@ mod access_registry {
 
             self.env().emit_event(EntitlementGranted {
                 account,
-                level: level.clone(),
+                level,
             });
 
             Ok(())
