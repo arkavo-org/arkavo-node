@@ -89,39 +89,7 @@ jobs:
       - name: Check sources (only crates.io + Polkadot SDK allowed)
         run: cargo deny check sources
 
-  # Lint - clippy on both node and contracts
-  lint-node:
-    name: Clippy (Node & Runtime)
-    runs-on: ubuntu-latest
-    needs: security
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: nightly
-          components: clippy, rust-src
-          target: wasm32-unknown-unknown
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-node-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - name: Run clippy on runtime (node skipped due to pallet-staking issue)
-        run: cargo +nightly clippy --package arkavo-runtime
-
+  # Lint contracts (node lint merged into build-and-lint-node for efficiency)
   lint-contracts:
     name: Clippy (Contracts)
     runs-on: ubuntu-latest
@@ -160,11 +128,11 @@ jobs:
             -W clippy::expect_used \
             -A clippy::cargo_common_metadata
 
-  # Build - node and contracts
-  build-node:
-    name: Build Node
+  # Build - node and contracts (clippy + build combined for efficiency)
+  build-and-lint-node:
+    name: Build & Lint Node
     runs-on: ubuntu-latest
-    needs: lint-node
+    needs: security
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -174,7 +142,7 @@ jobs:
         with:
           toolchain: nightly
           target: wasm32-unknown-unknown
-          components: rust-src
+          components: clippy, rust-src
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -189,6 +157,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang libssl-dev llvm libudev-dev protobuf-compiler
+
+      - name: Run clippy on runtime (node skipped due to pallet-staking issue)
+        run: cargo +nightly clippy --package arkavo-runtime
 
       - name: Build node
         run: cargo +nightly build --package arkavo-node
@@ -254,7 +225,7 @@ jobs:
   test-node:
     name: Test Node
     runs-on: ubuntu-latest
-    needs: build-node
+    needs: build-and-lint-node
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -325,7 +296,7 @@ jobs:
   docker-check:
     name: Validate Docker Build
     runs-on: ubuntu-latest
-    needs: build-node
+    needs: build-and-lint-node
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
