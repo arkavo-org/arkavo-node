@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "access_registry",
+    "attribute_store",
+    "policy_engine",
+    "payment_integration",
+]
+resolver = "2"
+
+[workspace.package]
+authors = ["Arkavo Team"]
+edition = "2024"
+license = "GPL-3.0"
+
+[workspace.dependencies]
+ink = { version = "6.0.0-beta.1", default-features = false }
+
+[profile.release]
+panic = "unwind"
+lto = true
+opt-level = "z"
+overflow-checks = true

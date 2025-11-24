@@ -13,9 +13,24 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
-# RustRover
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+# RustRover / IntelliJ IDEA
+.idea/
+
+# Claude Code
+/.claude/
+
+# act (local GitHub Actions)
+.actrc
+
+# OS-specific
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Test artifacts
+tools/test-results.md
+tools/node-test.log
+
+# Vendored dependencies (use Cargo.toml dependencies instead)
+libs/

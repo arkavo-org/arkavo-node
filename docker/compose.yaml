@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  arkavo-node:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: arkavo-node
+    ports:
+      - "9944:9944"  # WebSocket
+      - "9933:9933"  # HTTP RPC
+      - "30333:30333" # P2P
+    volumes:
+      - arkavo-data:/arkavo/data
+    command: [
+      "--dev",
+      "--unsafe-rpc-external",
+      "--rpc-cors=all",
+      "--rpc-methods=unsafe",
+      "--base-path=/arkavo/data"
+    ]
+    restart: unless-stopped
+    networks:
+      - arkavo-network
+
+  # Optional: Polkadot.js Apps UI for interacting with the node
+  polkadot-ui:
+    image: jacogr/polkadot-js-apps:latest
+    container_name: arkavo-ui
+    ports:
+      - "3000:80"
+    environment:
+      - WS_URL=ws://arkavo-node:9944
+    depends_on:
+      - arkavo-node
+    restart: unless-stopped
+    networks:
+      - arkavo-network
+
+volumes:
+  arkavo-data:
+    driver: local
+
+networks:
+  arkavo-network:
+    driver: bridge

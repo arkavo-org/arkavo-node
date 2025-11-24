@@ -1,0 +1,113 @@
+name: Security Checks
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run security audit daily at 00:00 UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        run: cargo audit --deny warnings
+
+  deny:
+    name: Dependency Policy Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Check licenses and vulnerabilities
+        run: cargo deny check
+
+      - name: Check for duplicate dependencies
+        run: cargo tree -d
+
+  unsafe-code:
+    name: Unsafe Code Detection
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Find unsafe code blocks
+        run: |
+          echo "Searching for unsafe code blocks..."
+          rg "unsafe" --type rust --stats || echo "No unsafe code found"
+
+      - name: Find unwrap usage
+        run: |
+          echo "Searching for unwrap() usage..."
+          rg "\.unwrap\(\)" --type rust --stats || echo "No unwrap() found"
+
+      - name: Find expect usage
+        run: |
+          echo "Searching for expect() usage..."
+          rg "\.expect\(" --type rust --stats || echo "No expect() found"
+
+      - name: Find panic usage
+        run: |
+          echo "Searching for panic! usage..."
+          rg "panic!\(" --type rust --stats || echo "No panic!() found"
+
+  supply-chain:
+    name: Supply Chain Security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Check dependency sources
+        run: |
+          echo "Checking dependency sources..."
+          cargo metadata --format-version 1 | jq -r '.packages[] | select(.source != null) | "\(.name): \(.source)"' | sort -u
+
+      - name: Verify git dependencies are pinned
+        run: |
+          echo "Verifying git dependencies are commit-pinned..."
+          cargo metadata --format-version 1 | jq -r '.packages[] | select(.source | contains("git+")) | "\(.name): \(.source)"'
