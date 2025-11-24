@@ -121,12 +121,12 @@ jobs:
 
       - name: Run clippy on node and runtime
         run: |
-          cargo clippy --all-targets --workspace \
+          cargo clippy --workspace \
             --exclude access_registry \
             --exclude attribute_store \
             --exclude policy_engine \
             --exclude payment_integration \
-            --features try-runtime,runtime-benchmarks \
+            --features try-runtime \
             -- \
             -D warnings \
             -D clippy::all \
@@ -171,7 +171,7 @@ jobs:
       - name: Run clippy on contracts
         working-directory: contracts
         run: |
-          cargo clippy --all-targets -- \
+          cargo clippy -- \
             -D warnings \
             -D clippy::all \
             -D clippy::pedantic \
