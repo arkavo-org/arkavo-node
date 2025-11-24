@@ -23,7 +23,7 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: nightly
           target: wasm32-unknown-unknown
           components: rust-src
 
@@ -42,10 +42,10 @@ jobs:
           sudo apt-get install -y clang libssl-dev llvm libudev-dev protobuf-compiler
 
       - name: Build node (release)
-        run: cargo build --release --package arkavo-node
+        run: cargo +nightly build --release --package arkavo-node
 
       - name: Build runtime (release)
-        run: cargo build --release --package arkavo-runtime
+        run: cargo +nightly build --release --package arkavo-runtime
 
       - name: Upload node binary
         uses: actions/upload-artifact@v4

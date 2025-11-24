@@ -139,7 +139,7 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: nightly
           target: wasm32-unknown-unknown
           components: rust-src
 
@@ -149,7 +149,7 @@ jobs:
           sudo apt-get install -y clang libssl-dev llvm libudev-dev protobuf-compiler
 
       - name: Build node
-        run: cargo build --package arkavo-node
+        run: cargo +nightly build --package arkavo-node
 
       - name: Run tests
-        run: cargo test --workspace --exclude access_registry --exclude attribute_store --exclude policy_engine --exclude payment_integration
+        run: cargo +nightly test --workspace --exclude access_registry --exclude attribute_store --exclude policy_engine --exclude payment_integration

@@ -101,8 +101,8 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
-          components: clippy
+          toolchain: nightly
+          components: clippy, rust-src
           target: wasm32-unknown-unknown
 
       - name: Cache cargo
@@ -120,7 +120,7 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Run clippy on runtime (node skipped due to pallet-staking issue)
-        run: cargo clippy --package arkavo-runtime
+        run: cargo +nightly clippy --package arkavo-runtime
 
   lint-contracts:
     name: Clippy (Contracts)
@@ -138,7 +138,7 @@ jobs:
           target: wasm32-unknown-unknown
 
       - name: Install cargo-contract
-        run: cargo install cargo-contract --locked --version ^4.0
+        run: cargo install cargo-contract --locked --version 6.0.0-beta.1
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -172,7 +172,7 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: nightly
           target: wasm32-unknown-unknown
           components: rust-src
 
@@ -191,10 +191,10 @@ jobs:
           sudo apt-get install -y clang libssl-dev llvm libudev-dev protobuf-compiler
 
       - name: Build node
-        run: cargo build --package arkavo-node
+        run: cargo +nightly build --package arkavo-node
 
       - name: Build runtime
-        run: cargo build --package arkavo-runtime
+        run: cargo +nightly build --package arkavo-runtime
 
       - name: Upload node binary
         uses: actions/upload-artifact@v4
@@ -225,7 +225,7 @@ jobs:
           target: wasm32-unknown-unknown
 
       - name: Install cargo-contract
-        run: cargo install cargo-contract --locked --version ^4.0
+        run: cargo install cargo-contract --locked --version 6.0.0-beta.1
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -262,7 +262,7 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: nightly
           target: wasm32-unknown-unknown
           components: rust-src
 
@@ -281,7 +281,7 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Run tests
-        run: cargo test --workspace --exclude access_registry --exclude attribute_store --exclude policy_engine --exclude payment_integration
+        run: cargo +nightly test --workspace --exclude access_registry --exclude attribute_store --exclude policy_engine --exclude payment_integration
 
   test-contracts:
     name: Test Contract (${{ matrix.contract }})
@@ -305,7 +305,7 @@ jobs:
           target: wasm32-unknown-unknown
 
       - name: Install cargo-contract
-        run: cargo install cargo-contract --locked --version ^4.0
+        run: cargo install cargo-contract --locked --version 6.0.0-beta.1
 
       - name: Cache cargo
         uses: actions/cache@v4
