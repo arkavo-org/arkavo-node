@@ -145,7 +145,6 @@ jobs:
     name: Clippy (Contracts)
     runs-on: ubuntu-latest
     needs: security
-    if: contains(github.event.pull_request.changed_files, 'contracts/')
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -226,7 +225,6 @@ jobs:
     name: Build Contract (${{ matrix.contract }})
     runs-on: ubuntu-latest
     needs: lint-contracts
-    if: contains(github.event.pull_request.changed_files, 'contracts/')
     strategy:
       matrix:
         contract:
@@ -306,7 +304,6 @@ jobs:
     name: Test Contract (${{ matrix.contract }})
     runs-on: ubuntu-latest
     needs: build-contracts
-    if: contains(github.event.pull_request.changed_files, 'contracts/')
     strategy:
       matrix:
         contract:
