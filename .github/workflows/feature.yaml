@@ -126,7 +126,7 @@ jobs:
             --exclude attribute_store \
             --exclude policy_engine \
             --exclude payment_integration \
-            --all-features \
+            --features try-runtime,runtime-benchmarks \
             -- \
             -D warnings \
             -D clippy::all \
