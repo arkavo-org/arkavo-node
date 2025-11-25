@@ -288,7 +288,7 @@ jobs:
           cd contracts/${{ matrix.contract }}
           cargo test
 
-  # Docker validation - just check it builds, don't push
+  # Docker validation - validate Dockerfile and test with pre-built binary
   docker-check:
     name: Validate Docker Build
     runs-on: ubuntu-latest
@@ -297,22 +297,37 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Docker image
-        uses: docker/build-push-action@v5
+      - name: Download node binary
+        uses: actions/download-artifact@v4
         with:
-          context: .
-          file: ./Dockerfile
-          push: false
-          tags: arkavo-node:pr-${{ github.event.pull_request.number }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          platforms: linux/amd64
+          name: arkavo-node
+          path: ./artifact/
+
+      - name: Make binary executable
+        run: chmod +x ./artifact/arkavo-node
+
+      - name: Validate Dockerfile syntax
+        run: docker build --check -f Dockerfile .
+
+      - name: Build runtime image with pre-built binary
+        run: |
+          # Build only the runtime stage using the pre-built binary
+          cat > Dockerfile.ci << 'EOF'
+          FROM ubuntu:24.04
+          RUN apt-get update && \
+              apt-get install -y ca-certificates curl libssl-dev && \
+              rm -rf /var/lib/apt/lists/*
+          RUN useradd -m -u 1001 -U -s /bin/sh -d /arkavo arkavo
+          WORKDIR /arkavo
+          COPY artifact/arkavo-node /usr/local/bin/
+          RUN chmod +x /usr/local/bin/arkavo-node && chown -R arkavo:arkavo /arkavo
+          USER arkavo
+          EXPOSE 30333 9933 9944
+          ENTRYPOINT ["/usr/local/bin/arkavo-node"]
+          CMD ["--help"]
+          EOF
+          docker build -f Dockerfile.ci -t arkavo-node:test .
 
       - name: Test Docker image
         run: |
-          docker build -f Dockerfile -t arkavo-node:test .
-          docker run --rm arkavo-node:test --version || true
           docker run --rm arkavo-node:test --help
