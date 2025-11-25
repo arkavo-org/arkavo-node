@@ -315,7 +315,8 @@ mod payment_integration {
         #[ink::test]
         fn new_works() {
             let contract = PaymentIntegration::new();
-            let owner = Address::from([0x01; 20]);
+            // Owner is set to the default caller (zero address in test env)
+            let owner = Address::default();
             assert_eq!(contract.owner(), owner);
             assert!(contract.is_authorized_processor(owner));
         }

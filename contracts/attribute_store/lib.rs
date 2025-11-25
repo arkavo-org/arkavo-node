@@ -217,8 +217,9 @@ mod attribute_store {
 
         #[ink::test]
         fn new_works() {
-            let _contract = AttributeStore::new();
-            // Contract initializes successfully
+            let contract = AttributeStore::new();
+            // Owner is set to the default caller (zero address in test env)
+            assert_eq!(contract.owner(), Address::default());
         }
 
         #[ink::test]

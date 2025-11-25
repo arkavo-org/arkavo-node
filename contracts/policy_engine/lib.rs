@@ -288,7 +288,8 @@ mod policy_engine {
         #[ink::test]
         fn new_works() {
             let contract = PolicyEngine::new();
-            // Owner should be the caller (default test caller)
+            // Owner is set to the default caller (zero address in test env)
+            assert_eq!(contract.owner(), Address::default());
             assert_eq!(contract.next_policy_id(), 0);
         }
 
