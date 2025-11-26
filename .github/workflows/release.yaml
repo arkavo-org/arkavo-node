@@ -27,14 +27,11 @@ jobs:
           target: wasm32-unknown-unknown
           components: rust-src
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: release
+          cache-on-failure: true
 
       - name: Install dependencies
         run: |
@@ -44,8 +41,7 @@ jobs:
       - name: Build node (release)
         run: cargo +nightly build --release --package arkavo-node
 
-      - name: Build runtime (release)
-        run: cargo +nightly build --release --package arkavo-runtime
+      # Removed: Build runtime - already built as dependency of node
 
       - name: Upload node binary
         uses: actions/upload-artifact@v4
@@ -61,7 +57,7 @@ jobs:
           path: target/release/wbuild/arkavo-runtime/arkavo_runtime.compact.compressed.wasm
           retention-days: 90
 
-  # Build and publish Docker image
+  # Build and publish Docker image using pre-built binary
   docker-publish:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
@@ -72,6 +68,15 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Download node binary
+        uses: actions/download-artifact@v4
+        with:
+          name: arkavo-node-${{ github.sha }}
+          path: ./target/release/
+
+      - name: Make binary executable
+        run: chmod +x ./target/release/arkavo-node
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -94,19 +99,34 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix={{branch}}-
 
+      - name: Create Dockerfile for pre-built binary
+        run: |
+          cat > Dockerfile.release << 'EOF'
+          FROM ubuntu:24.04
+          RUN apt-get update && \
+              apt-get install -y ca-certificates curl libssl-dev && \
+              rm -rf /var/lib/apt/lists/*
+          RUN useradd -m -u 1001 -U -s /bin/sh -d /arkavo arkavo
+          WORKDIR /arkavo
+          COPY target/release/arkavo-node /usr/local/bin/
+          RUN chmod +x /usr/local/bin/arkavo-node && chown -R arkavo:arkavo /arkavo
+          USER arkavo
+          EXPOSE 30333 9933 9944
+          ENTRYPOINT ["/usr/local/bin/arkavo-node"]
+          CMD ["--dev", "--unsafe-rpc-external", "--rpc-cors=all"]
+          EOF
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile
+          file: ./Dockerfile.release
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
-          build-args: |
-            GIT_COMMIT=${{ github.sha }}
 
       - name: Test Docker image
         run: |
