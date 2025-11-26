@@ -88,11 +88,10 @@ jobs:
       - name: Check sources (only crates.io + Polkadot SDK allowed)
         run: cargo deny check sources
 
-  # Build - node and contracts (clippy + build combined for efficiency)
+  # Build - node and contracts (runs in parallel with quick-checks and security)
   build-and-lint-node:
     name: Build & Lint Node
     runs-on: ubuntu-latest
-    needs: [quick-checks, security]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -130,11 +129,11 @@ jobs:
           path: target/debug/arkavo-node
           retention-days: 7
 
-  # Build & Lint contracts (merged lint-contracts + build-contracts for efficiency)
+  # Build & Lint contracts (runs in parallel with quick-checks and security)
   build-contracts:
     name: Build & Lint Contract (${{ matrix.contract }})
     runs-on: ubuntu-latest
-    needs: [quick-checks, security]
+    # No dependencies - runs immediately in parallel with quick-checks and security
     strategy:
       matrix:
         contract:
