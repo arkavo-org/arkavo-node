@@ -59,11 +59,10 @@ cargo clippy --all-targets -- -D warnings
    - Chain specifications in `chain_spec.rs` define genesis state with pre-funded accounts (Alice, Bob, etc.)
 
 2. **Runtime (`runtime/`)**: The state transition function compiled to WASM
-   - Configured with `pallet-contracts` for Ink! smart contract execution
+   - Configured with `pallet-revive` for Ink! smart contract execution (PolkaVM)
    - Block time: 6 seconds (MILLISECS_PER_BLOCK = 6000)
-   - Key pallets: Balances, Timestamp, Sudo, TransactionPayment, Contracts
-   - Uses `RandomnessCollectiveFlip` for contract randomness
-   - Contract limits: MaxCodeLen = 123KB, MaxStorageKeyLen = 128 bytes
+   - Key pallets: Balances, Timestamp, Sudo, TransactionPayment, Revive
+   - Runtime memory: 128 MB, PVF memory: 512 MB
 
 3. **Ink! Smart Contracts (`contracts/`)**: On-chain business logic for access control
    - **access_registry**: Manages 4-tier entitlement levels (None/Basic/Premium/VIP)
@@ -130,15 +129,25 @@ cargo contract build --release
 # Artifacts output to: contracts/*/target/ink/*.{wasm,json}
 ```
 
-### Tools
+### Contract Deployment
+
+Deploy contracts using `cargo-contract` CLI (v5.x+ required for pallet-revive support):
 
 ```bash
-# Build deployer tool
-cargo build --quiet --package deployer
+# Install cargo-contract
+cargo install cargo-contract --locked
 
-# Use deployer
-cargo run --package deployer -- --endpoint ws://127.0.0.1:9944 deploy-all --account alice
+# Deploy a contract
+cargo contract instantiate \
+  --url ws://127.0.0.1:9944 \
+  --suri //Alice \
+  --constructor new \
+  --skip-confirm \
+  --execute \
+  contracts/target/ink/access_registry/access_registry.contract
 ```
+
+See `tools/deployer/README.md` for full deployment workflow including cross-contract configuration.
 
 ## Testing
 
@@ -238,6 +247,6 @@ docker-compose logs -f arkavo-node
 
 **Runtime Panics**: Check `runtime/src/lib.rs` pallet configurations match the `construct_runtime!` macro order.
 
-**Contract Upload Fails**: Verify `pallet-contracts` configuration in runtime, especially `MaxCodeLen` and deposit limits.
+**Contract Upload Fails**: Verify `pallet-revive` configuration in runtime, especially deposit limits and memory settings.
 
-**WASM Build Errors**: Ensure `wasm32-unknown-unknown` target installed: `rustup target add wasm32-unknown-unknown`
+**Build Errors**: Ensure required targets are installed: `rustup target add wasm32-unknown-unknown riscv64imac-unknown-none-elf`

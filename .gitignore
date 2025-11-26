@@ -34,3 +34,6 @@ tools/node-test.log
 
 # Vendored dependencies (use Cargo.toml dependencies instead)
 libs/
+
+# Production deployment (contains binaries)
+production/
