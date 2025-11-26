@@ -24,11 +24,10 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          cache-on-failure: true
 
       - name: Cache cargo-deny
         id: cache-cargo-deny
@@ -112,15 +111,29 @@ jobs:
           toolchain: stable
           target: wasm32-unknown-unknown
 
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
+      - name: Cache cargo-outdated
+        id: cache-cargo-outdated
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-outdated
+          key: ${{ runner.os }}-cargo-outdated-0.15
+
+      - name: Install cargo-outdated
+        if: steps.cache-cargo-outdated.outputs.cache-hit != 'true'
+        run: cargo install cargo-outdated --locked
+
       - name: Check for outdated dependencies
-        run: |
-          cargo install cargo-outdated --locked
-          cargo outdated --exit-code 1 || echo "::warning::Outdated dependencies found"
+        run: cargo outdated --exit-code 1 || echo "::warning::Outdated dependencies found"
         continue-on-error: true
 
       - name: Check Substrate updates
@@ -142,6 +155,12 @@ jobs:
           toolchain: nightly
           target: wasm32-unknown-unknown
           components: rust-src
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-build
+          cache-on-failure: true
 
       - name: Install dependencies
         run: |

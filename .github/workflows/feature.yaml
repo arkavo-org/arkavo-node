@@ -49,11 +49,11 @@ jobs:
           echo "Searching for panic! usage..."
           rg "panic!\(" --type rust --stats || echo "No panic!() found"
 
-  # Security checks - audit, deny, supply chain
+  # Security checks - audit, deny, supply chain (runs in parallel with quick-checks)
   security:
     name: Security Checks
     runs-on: ubuntu-latest
-    needs: quick-checks
+    # Removed: needs: quick-checks - these are independent checks
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -63,11 +63,10 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          cache-on-failure: true
 
       - name: Cache cargo-deny
         id: cache-cargo-deny
@@ -89,47 +88,11 @@ jobs:
       - name: Check sources (only crates.io + Polkadot SDK allowed)
         run: cargo deny check sources
 
-  # Lint contracts (node lint merged into build-and-lint-node for efficiency)
-  lint-contracts:
-    name: Clippy (Contracts)
-    runs-on: ubuntu-latest
-    needs: security
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
-          components: clippy, rust-src
-          target: wasm32-unknown-unknown
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-contracts-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run clippy on contracts
-        working-directory: contracts
-        run: |
-          cargo clippy -- \
-            -D warnings \
-            -D clippy::all \
-            -D clippy::pedantic \
-            -W clippy::unwrap_used \
-            -W clippy::expect_used \
-            -A clippy::cargo_common_metadata
-
   # Build - node and contracts (clippy + build combined for efficiency)
   build-and-lint-node:
     name: Build & Lint Node
     runs-on: ubuntu-latest
-    needs: security
+    needs: [quick-checks, security]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -141,14 +104,11 @@ jobs:
           target: wasm32-unknown-unknown
           components: clippy, rust-src
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-node-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: node
+          cache-on-failure: true
 
       - name: Install dependencies
         run: |
@@ -161,8 +121,7 @@ jobs:
       - name: Build node
         run: cargo +nightly build --package arkavo-node
 
-      - name: Build runtime
-        run: cargo +nightly build --package arkavo-runtime
+      # Removed: Build runtime - already built as dependency of node
 
       - name: Upload node binary
         uses: actions/upload-artifact@v4
@@ -171,10 +130,11 @@ jobs:
           path: target/debug/arkavo-node
           retention-days: 7
 
+  # Build & Lint contracts (merged lint-contracts + build-contracts for efficiency)
   build-contracts:
-    name: Build Contract (${{ matrix.contract }})
+    name: Build & Lint Contract (${{ matrix.contract }})
     runs-on: ubuntu-latest
-    needs: lint-contracts
+    needs: [quick-checks, security]
     strategy:
       matrix:
         contract:
@@ -191,24 +151,40 @@ jobs:
         with:
           toolchain: stable
           target: wasm32-unknown-unknown
-          components: rust-src
+          components: clippy, rust-src
 
-      - name: Install cargo-contract
-        run: cargo install cargo-contract --locked --version 6.0.0-beta.1
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts -> target
+          shared-key: contracts-${{ matrix.contract }}
+          cache-on-failure: true
 
-      - name: Cache cargo
+      - name: Cache cargo-contract
+        id: cache-cargo-contract
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            contracts/${{ matrix.contract }}/target
-          key: ${{ runner.os }}-cargo-contract-${{ matrix.contract }}-${{ hashFiles('**/Cargo.lock') }}
+          path: ~/.cargo/bin/cargo-contract
+          key: ${{ runner.os }}-cargo-contract-6.0.0-beta.1
+
+      - name: Install cargo-contract
+        if: steps.cache-cargo-contract.outputs.cache-hit != 'true'
+        run: cargo install cargo-contract --locked --version 6.0.0-beta.1
+
+      - name: Lint contract
+        working-directory: contracts/${{ matrix.contract }}
+        run: |
+          cargo clippy -- \
+            -D warnings \
+            -D clippy::all \
+            -D clippy::pedantic \
+            -W clippy::unwrap_used \
+            -W clippy::expect_used \
+            -A clippy::cargo_common_metadata
 
       - name: Build contract
-        run: |
-          cd contracts/${{ matrix.contract }}
-          cargo contract build
+        working-directory: contracts/${{ matrix.contract }}
+        run: cargo contract build
 
       - name: Upload contract artifacts
         uses: actions/upload-artifact@v4
@@ -235,14 +211,11 @@ jobs:
           target: wasm32-unknown-unknown
           components: rust-src
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-node-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: node
+          cache-on-failure: true
 
       - name: Install dependencies
         run: |
@@ -274,19 +247,16 @@ jobs:
           target: wasm32-unknown-unknown
           components: rust-src
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            contracts/${{ matrix.contract }}/target
-          key: ${{ runner.os }}-cargo-contract-${{ matrix.contract }}-${{ hashFiles('**/Cargo.lock') }}
+          workspaces: contracts -> target
+          shared-key: contracts-${{ matrix.contract }}
+          cache-on-failure: true
 
       - name: Run contract tests
-        run: |
-          cd contracts/${{ matrix.contract }}
-          cargo test
+        working-directory: contracts/${{ matrix.contract }}
+        run: cargo test
 
   # Docker validation - validate Dockerfile and test with pre-built binary
   docker-check:
