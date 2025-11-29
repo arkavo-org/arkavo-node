@@ -6,7 +6,10 @@ mod access_registry {
 
     /// Defines entitlement levels for access control
     #[derive(Default, Debug, PartialEq, Eq, Clone, Copy, scale::Encode, scale::Decode)]
-    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout))]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
     pub enum EntitlementLevel {
         #[default]
         None,
@@ -21,7 +24,10 @@ mod access_registry {
     /// possess the ephemeral private key corresponding to `eph_pub_key`
     /// to prove ownership of the session.
     #[derive(Default, Debug, PartialEq, Eq, Clone, scale::Encode, scale::Decode)]
-    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout))]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
     pub struct SessionGrant {
         /// Ephemeral public key (33 bytes compressed EC point).
         /// The agent signs requests with the corresponding private key.
@@ -37,6 +43,38 @@ mod access_registry {
         pub created_at_block: u64,
     }
 
+    /// Merkle proof for an attribute.
+    ///
+    /// Used to prove possession of an attribute without revealing all attributes.
+    #[derive(Debug, PartialEq, Eq, Clone, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub struct AttributeProof {
+        /// Attribute hash: H(namespace | name | value | salt)
+        pub attribute_hash: [u8; 32],
+        /// Merkle proof path (sibling hashes from leaf to root)
+        pub proof_path: ink::prelude::vec::Vec<[u8; 32]>,
+        /// Position indicators (0 = left, 1 = right) for each level
+        pub proof_indices: ink::prelude::vec::Vec<u8>,
+    }
+
+    /// Scope requirement definition.
+    ///
+    /// Defines what attributes are required to access a particular scope.
+    #[derive(Debug, PartialEq, Eq, Clone, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub struct ScopeRequirement {
+        /// Required attribute hashes for this scope
+        pub required_attributes: ink::prelude::vec::Vec<[u8; 32]>,
+        /// Whether this scope is active
+        pub active: bool,
+    }
+
     /// Access registry contract for managing entitlements
     #[ink(storage)]
     pub struct AccessRegistry {
@@ -46,6 +84,10 @@ mod access_registry {
         sessions: Mapping<[u8; 32], SessionGrant>,
         /// Contract owner who can grant/revoke entitlements
         owner: Address,
+        /// Reference to attribute_store contract for Merkle root lookups
+        attribute_store: Option<Address>,
+        /// Scope requirements: scope_id -> required attribute hashes
+        scope_requirements: Mapping<[u8; 32], ScopeRequirement>,
     }
 
     /// Events emitted by the contract
@@ -75,6 +117,22 @@ mod access_registry {
         session_id: [u8; 32],
     }
 
+    #[ink(event)]
+    pub struct SessionRequested {
+        #[ink(topic)]
+        session_id: [u8; 32],
+        #[ink(topic)]
+        requester: Address,
+        scope_id: [u8; 32],
+        expires_at_block: u64,
+    }
+
+    #[ink(event)]
+    pub struct ScopeRequirementSet {
+        #[ink(topic)]
+        scope_id: [u8; 32],
+    }
+
     /// Errors that can occur during contract execution
     #[derive(Debug, PartialEq, Eq, Clone, scale::Encode, scale::Decode)]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
@@ -85,6 +143,18 @@ mod access_registry {
         EntitlementNotFound,
         /// Session not found
         SessionNotFound,
+        /// Attribute store contract not configured
+        AttributeStoreNotConfigured,
+        /// Merkle root not found for account
+        RootNotFound,
+        /// Invalid Merkle proof
+        InvalidProof,
+        /// Missing required attribute proof
+        MissingRequiredAttribute,
+        /// Scope not found
+        ScopeNotFound,
+        /// Scope is inactive
+        ScopeInactive,
     }
 
     pub type Result<T> = core::result::Result<T, Error>;
@@ -103,6 +173,8 @@ mod access_registry {
                 entitlements: Mapping::default(),
                 sessions: Mapping::default(),
                 owner: Self::env().caller(),
+                attribute_store: None,
+                scope_requirements: Mapping::default(),
             }
         }
 
@@ -119,10 +191,7 @@ mod access_registry {
 
             self.entitlements.insert(account, &level);
 
-            self.env().emit_event(EntitlementGranted {
-                account,
-                level,
-            });
+            self.env().emit_event(EntitlementGranted { account, level });
 
             Ok(())
         }
@@ -149,11 +218,7 @@ mod access_registry {
 
         /// Check if an account has at least a specific entitlement level
         #[ink(message)]
-        pub fn has_entitlement(
-            &self,
-            account: Address,
-            required_level: EntitlementLevel,
-        ) -> bool {
+        pub fn has_entitlement(&self, account: Address, required_level: EntitlementLevel) -> bool {
             let current_level = self.get_entitlement(account);
             Self::level_value(current_level) >= Self::level_value(required_level)
         }
@@ -233,6 +298,189 @@ mod access_registry {
                 Err(Error::SessionNotFound)
             }
         }
+
+        /// Set the attribute_store contract address.
+        ///
+        /// Only the contract owner can configure this.
+        #[ink(message)]
+        pub fn set_attribute_store(&mut self, address: Address) -> Result<()> {
+            if self.env().caller() != self.owner {
+                return Err(Error::NotOwner);
+            }
+            self.attribute_store = Some(address);
+            Ok(())
+        }
+
+        /// Get the attribute_store contract address.
+        #[ink(message)]
+        pub fn get_attribute_store(&self) -> Option<Address> {
+            self.attribute_store
+        }
+
+        /// Set scope requirements.
+        ///
+        /// Only the contract owner can define scope requirements.
+        #[ink(message)]
+        pub fn set_scope_requirement(
+            &mut self,
+            scope_id: [u8; 32],
+            required_attributes: ink::prelude::vec::Vec<[u8; 32]>,
+            active: bool,
+        ) -> Result<()> {
+            if self.env().caller() != self.owner {
+                return Err(Error::NotOwner);
+            }
+
+            let requirement = ScopeRequirement {
+                required_attributes,
+                active,
+            };
+            self.scope_requirements.insert(scope_id, &requirement);
+
+            self.env().emit_event(ScopeRequirementSet { scope_id });
+
+            Ok(())
+        }
+
+        /// Get scope requirements.
+        #[ink(message)]
+        pub fn get_scope_requirement(&self, scope_id: [u8; 32]) -> Option<ScopeRequirement> {
+            self.scope_requirements.get(scope_id)
+        }
+
+        /// Request a session by proving attributes via Merkle proofs.
+        ///
+        /// The caller provides their attribute root and proofs. The contract:
+        /// 1. Verifies attribute_store is configured
+        /// 2. Validates each proof against the provided root
+        /// 3. Checks all required attributes for the scope are proven
+        /// 4. Creates and returns the session
+        ///
+        /// Note: In a full implementation, the root would be fetched via
+        /// cross-contract call to attribute_store.get_root(caller).
+        #[ink(message)]
+        pub fn request_session(
+            &mut self,
+            eph_pub_key: ink::prelude::vec::Vec<u8>,
+            scope_id: [u8; 32],
+            duration_blocks: u64,
+            proofs: ink::prelude::vec::Vec<AttributeProof>,
+            root: [u8; 32],
+        ) -> Result<[u8; 32]> {
+            let caller = self.env().caller();
+
+            // Verify attribute_store is configured
+            let _attribute_store = self
+                .attribute_store
+                .ok_or(Error::AttributeStoreNotConfigured)?;
+
+            // TODO: Cross-contract call to attribute_store.get_root(caller)
+            // For now, we accept the root parameter
+            // In production: verify root matches stored root
+
+            // Get scope requirements
+            let requirement = self
+                .scope_requirements
+                .get(scope_id)
+                .ok_or(Error::ScopeNotFound)?;
+
+            if !requirement.active {
+                return Err(Error::ScopeInactive);
+            }
+
+            // Verify each required attribute has a valid proof
+            for required_hash in &requirement.required_attributes {
+                let proof = proofs
+                    .iter()
+                    .find(|p| &p.attribute_hash == required_hash)
+                    .ok_or(Error::MissingRequiredAttribute)?;
+
+                if !self.verify_merkle_proof(
+                    &proof.attribute_hash,
+                    &proof.proof_path,
+                    &proof.proof_indices,
+                    &root,
+                ) {
+                    return Err(Error::InvalidProof);
+                }
+            }
+
+            // Generate session ID from caller + scope + block
+            let session_id = self.compute_session_id(&caller, &scope_id);
+
+            let expires_at_block = u64::from(self.env().block_number()) + duration_blocks;
+
+            let grant = SessionGrant {
+                eph_pub_key,
+                scope_id,
+                expires_at_block,
+                is_revoked: false,
+                created_at_block: u64::from(self.env().block_number()),
+            };
+
+            self.sessions.insert(session_id, &grant);
+
+            self.env().emit_event(SessionRequested {
+                session_id,
+                requester: caller,
+                scope_id,
+                expires_at_block,
+            });
+
+            Ok(session_id)
+        }
+
+        /// Verify a Merkle proof.
+        ///
+        /// Returns true if the proof path from leaf to root is valid.
+        fn verify_merkle_proof(
+            &self,
+            leaf: &[u8; 32],
+            proof_path: &[[u8; 32]],
+            proof_indices: &[u8],
+            root: &[u8; 32],
+        ) -> bool {
+            use ink::env::hash::{Blake2x256, HashOutput};
+
+            if proof_path.len() != proof_indices.len() {
+                return false;
+            }
+
+            let mut current = *leaf;
+
+            for (sibling, &index) in proof_path.iter().zip(proof_indices.iter()) {
+                let mut input = [0u8; 64];
+                if index == 0 {
+                    // Current is on the left
+                    input[..32].copy_from_slice(&current);
+                    input[32..].copy_from_slice(sibling);
+                } else {
+                    // Current is on the right
+                    input[..32].copy_from_slice(sibling);
+                    input[32..].copy_from_slice(&current);
+                }
+
+                let mut output = <Blake2x256 as HashOutput>::Type::default();
+                ink::env::hash_bytes::<Blake2x256>(&input, &mut output);
+                current = output;
+            }
+
+            current == *root
+        }
+
+        /// Compute session ID from caller, scope, and block number.
+        fn compute_session_id(&self, caller: &Address, scope_id: &[u8; 32]) -> [u8; 32] {
+            use ink::env::hash::{Blake2x256, HashOutput};
+
+            let mut input = ink::prelude::vec::Vec::new();
+            input.extend_from_slice(caller.as_ref());
+            input.extend_from_slice(scope_id);
+            input.extend_from_slice(&self.env().block_number().to_le_bytes());
+
+            let mut output = <Blake2x256 as HashOutput>::Type::default();
+            ink::env::hash_bytes::<Blake2x256>(&input, &mut output);
+            output
+        }
     }
 
     #[cfg(test)]
@@ -251,9 +499,11 @@ mod access_registry {
             let mut contract = AccessRegistry::new();
             let account = Address::from([0x02; 20]);
 
-            assert!(contract
-                .grant_entitlement(account, EntitlementLevel::Vip)
-                .is_ok());
+            assert!(
+                contract
+                    .grant_entitlement(account, EntitlementLevel::Vip)
+                    .is_ok()
+            );
             assert_eq!(contract.get_entitlement(account), EntitlementLevel::Vip);
         }
 
@@ -291,9 +541,11 @@ mod access_registry {
             let scope_id = [0x03u8; 32];
             let expires_at_block = 1000u64;
 
-            assert!(contract
-                .create_session(session_id, eph_pub_key.clone(), scope_id, expires_at_block)
-                .is_ok());
+            assert!(
+                contract
+                    .create_session(session_id, eph_pub_key.clone(), scope_id, expires_at_block)
+                    .is_ok()
+            );
 
             let grant = contract.get_session(session_id);
             assert!(grant.is_some());
@@ -337,6 +589,252 @@ mod access_registry {
                 contract.revoke_session(session_id),
                 Err(Error::SessionNotFound)
             );
+        }
+
+        #[ink::test]
+        fn set_attribute_store_works() {
+            let mut contract = AccessRegistry::new();
+            let address = Address::from([0x01; 20]);
+            assert!(contract.set_attribute_store(address).is_ok());
+            assert_eq!(contract.get_attribute_store(), Some(address));
+        }
+
+        #[ink::test]
+        fn set_scope_requirement_works() {
+            let mut contract = AccessRegistry::new();
+            let scope_id = [0x01u8; 32];
+            let required = ink::prelude::vec![[0xABu8; 32], [0xCDu8; 32]];
+
+            assert!(
+                contract
+                    .set_scope_requirement(scope_id, required.clone(), true)
+                    .is_ok()
+            );
+
+            let req = contract.get_scope_requirement(scope_id).unwrap();
+            assert_eq!(req.required_attributes, required);
+            assert!(req.active);
+        }
+
+        #[ink::test]
+        fn verify_merkle_proof_works() {
+            let contract = AccessRegistry::new();
+
+            // Build a simple 2-leaf Merkle tree
+            // Leaves: [A, B]
+            // Root: H(A || B)
+            use ink::env::hash::{Blake2x256, HashOutput};
+
+            let leaf_a = [0x01u8; 32];
+            let leaf_b = [0x02u8; 32];
+
+            // Compute root = H(leaf_a || leaf_b)
+            let mut root_input = [0u8; 64];
+            root_input[..32].copy_from_slice(&leaf_a);
+            root_input[32..].copy_from_slice(&leaf_b);
+            let mut root = <Blake2x256 as HashOutput>::Type::default();
+            ink::env::hash_bytes::<Blake2x256>(&root_input, &mut root);
+
+            // Proof for leaf_a: sibling is leaf_b, index 0 (left)
+            let proof_path = ink::prelude::vec![leaf_b];
+            let proof_indices = ink::prelude::vec![0u8];
+
+            assert!(contract.verify_merkle_proof(&leaf_a, &proof_path, &proof_indices, &root));
+
+            // Invalid proof should fail
+            let wrong_leaf = [0x99u8; 32];
+            assert!(!contract.verify_merkle_proof(&wrong_leaf, &proof_path, &proof_indices, &root));
+        }
+
+        #[ink::test]
+        fn request_session_fails_without_attribute_store() {
+            let mut contract = AccessRegistry::new();
+            let scope_id = [0x01u8; 32];
+
+            // Set up scope requirement
+            contract
+                .set_scope_requirement(scope_id, ink::prelude::vec![], true)
+                .unwrap();
+
+            let result = contract.request_session(
+                ink::prelude::vec![0x02u8; 33],
+                scope_id,
+                100,
+                ink::prelude::vec![],
+                [0u8; 32],
+            );
+
+            assert_eq!(result, Err(Error::AttributeStoreNotConfigured));
+        }
+
+        #[ink::test]
+        fn request_session_fails_for_unknown_scope() {
+            let mut contract = AccessRegistry::new();
+            let attribute_store = Address::from([0x99; 20]);
+            let scope_id = [0x01u8; 32];
+
+            contract.set_attribute_store(attribute_store).unwrap();
+
+            let result = contract.request_session(
+                ink::prelude::vec![0x02u8; 33],
+                scope_id,
+                100,
+                ink::prelude::vec![],
+                [0u8; 32],
+            );
+
+            assert_eq!(result, Err(Error::ScopeNotFound));
+        }
+
+        #[ink::test]
+        fn request_session_fails_for_inactive_scope() {
+            let mut contract = AccessRegistry::new();
+            let attribute_store = Address::from([0x99; 20]);
+            let scope_id = [0x01u8; 32];
+
+            contract.set_attribute_store(attribute_store).unwrap();
+            contract
+                .set_scope_requirement(scope_id, ink::prelude::vec![], false)
+                .unwrap();
+
+            let result = contract.request_session(
+                ink::prelude::vec![0x02u8; 33],
+                scope_id,
+                100,
+                ink::prelude::vec![],
+                [0u8; 32],
+            );
+
+            assert_eq!(result, Err(Error::ScopeInactive));
+        }
+
+        #[ink::test]
+        fn request_session_works_with_no_requirements() {
+            let mut contract = AccessRegistry::new();
+            let attribute_store = Address::from([0x99; 20]);
+            let scope_id = [0x01u8; 32];
+
+            contract.set_attribute_store(attribute_store).unwrap();
+            contract
+                .set_scope_requirement(scope_id, ink::prelude::vec![], true)
+                .unwrap();
+
+            let result = contract.request_session(
+                ink::prelude::vec![0x02u8; 33],
+                scope_id,
+                100,
+                ink::prelude::vec![],
+                [0u8; 32],
+            );
+
+            assert!(result.is_ok());
+            let session_id = result.unwrap();
+            let grant = contract.get_session(session_id).unwrap();
+            assert_eq!(grant.scope_id, scope_id);
+        }
+
+        #[ink::test]
+        fn request_session_works_with_valid_proofs() {
+            let mut contract = AccessRegistry::new();
+            let scope_id = [0x01u8; 32];
+            let attribute_store = Address::from([0x99; 20]);
+
+            contract.set_attribute_store(attribute_store).unwrap();
+
+            // Build Merkle tree with one required attribute
+            use ink::env::hash::{Blake2x256, HashOutput};
+
+            let attr_hash = [0xABu8; 32];
+            let sibling = [0xCDu8; 32];
+
+            // Root = H(attr_hash || sibling)
+            let mut root_input = [0u8; 64];
+            root_input[..32].copy_from_slice(&attr_hash);
+            root_input[32..].copy_from_slice(&sibling);
+            let mut root = <Blake2x256 as HashOutput>::Type::default();
+            ink::env::hash_bytes::<Blake2x256>(&root_input, &mut root);
+
+            // Set scope requirement
+            contract
+                .set_scope_requirement(scope_id, ink::prelude::vec![attr_hash], true)
+                .unwrap();
+
+            // Create proof
+            let proof = AttributeProof {
+                attribute_hash: attr_hash,
+                proof_path: ink::prelude::vec![sibling],
+                proof_indices: ink::prelude::vec![0],
+            };
+
+            let result = contract.request_session(
+                ink::prelude::vec![0x02u8; 33],
+                scope_id,
+                100,
+                ink::prelude::vec![proof],
+                root,
+            );
+
+            assert!(result.is_ok());
+            let session_id = result.unwrap();
+            let grant = contract.get_session(session_id).unwrap();
+            assert_eq!(grant.scope_id, scope_id);
+        }
+
+        #[ink::test]
+        fn request_session_fails_with_invalid_proof() {
+            let mut contract = AccessRegistry::new();
+            let scope_id = [0x01u8; 32];
+            let attribute_store = Address::from([0x99; 20]);
+
+            contract.set_attribute_store(attribute_store).unwrap();
+
+            let attr_hash = [0xABu8; 32];
+
+            // Set scope requirement
+            contract
+                .set_scope_requirement(scope_id, ink::prelude::vec![attr_hash], true)
+                .unwrap();
+
+            // Create proof with wrong root
+            let proof = AttributeProof {
+                attribute_hash: attr_hash,
+                proof_path: ink::prelude::vec![[0xCDu8; 32]],
+                proof_indices: ink::prelude::vec![0],
+            };
+
+            let result = contract.request_session(
+                ink::prelude::vec![0x02u8; 33],
+                scope_id,
+                100,
+                ink::prelude::vec![proof],
+                [0x99u8; 32], // Wrong root
+            );
+
+            assert_eq!(result, Err(Error::InvalidProof));
+        }
+
+        #[ink::test]
+        fn request_session_fails_with_missing_attribute() {
+            let mut contract = AccessRegistry::new();
+            let scope_id = [0x01u8; 32];
+            let attribute_store = Address::from([0x99; 20]);
+
+            contract.set_attribute_store(attribute_store).unwrap();
+
+            // Require an attribute but don't provide proof for it
+            contract
+                .set_scope_requirement(scope_id, ink::prelude::vec![[0xABu8; 32]], true)
+                .unwrap();
+
+            let result = contract.request_session(
+                ink::prelude::vec![0x02u8; 33],
+                scope_id,
+                100,
+                ink::prelude::vec![], // No proofs
+                [0u8; 32],
+            );
+
+            assert_eq!(result, Err(Error::MissingRequiredAttribute));
         }
     }
 }
