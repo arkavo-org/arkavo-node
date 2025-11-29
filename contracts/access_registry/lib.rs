@@ -194,7 +194,7 @@ mod access_registry {
                 scope_id,
                 expires_at_block,
                 is_revoked: false,
-                created_at_block: self.env().block_number() as u64,
+                created_at_block: u64::from(self.env().block_number()),
             };
 
             self.sessions.insert(session_id, &grant);
