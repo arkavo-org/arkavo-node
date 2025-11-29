@@ -21,6 +21,10 @@ mod attribute_store {
         authorized_writers: Mapping<(Address, Address), bool>,
         /// Contract owner
         owner: Address,
+        /// Mapping from user account to their attribute Merkle root
+        roots: Mapping<Address, [u8; 32]>,
+        /// Authorized identity providers that can set Merkle roots
+        authorized_anchors: Mapping<Address, bool>,
     }
 
     /// Events emitted by the contract
@@ -57,6 +61,25 @@ mod attribute_store {
         writer: Address,
     }
 
+    #[ink(event)]
+    pub struct RootUpdated {
+        #[ink(topic)]
+        account: Address,
+        root: [u8; 32],
+    }
+
+    #[ink(event)]
+    pub struct AnchorAdded {
+        #[ink(topic)]
+        anchor: Address,
+    }
+
+    #[ink(event)]
+    pub struct AnchorRemoved {
+        #[ink(topic)]
+        anchor: Address,
+    }
+
     /// Errors that can occur during contract execution
     #[derive(Debug, PartialEq, Eq, Clone, scale::Encode, scale::Decode)]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
@@ -67,6 +90,10 @@ mod attribute_store {
         AttributeNotFound,
         /// Input string exceeds maximum length
         InputTooLong,
+        /// Caller is not the contract owner
+        NotOwner,
+        /// Caller is not an authorized anchor
+        NotAuthorizedAnchor,
     }
 
     pub type Result<T> = core::result::Result<T, Error>;
@@ -85,6 +112,8 @@ mod attribute_store {
                 attributes: Mapping::default(),
                 authorized_writers: Mapping::default(),
                 owner: Self::env().caller(),
+                roots: Mapping::default(),
+                authorized_anchors: Mapping::default(),
             }
         }
 
@@ -139,7 +168,8 @@ mod attribute_store {
                 return Err(Error::NotAuthorized);
             }
 
-            self.attributes.remove((account, namespace.clone(), key.clone()));
+            self.attributes
+                .remove((account, namespace.clone(), key.clone()));
 
             self.env().emit_event(AttributeRemoved {
                 account,
@@ -209,6 +239,68 @@ mod attribute_store {
         pub fn owner(&self) -> Address {
             self.owner
         }
+
+        /// Set the Merkle root for a user's attributes.
+        /// Can only be called by authorized anchors (identity providers).
+        #[ink(message)]
+        pub fn set_root(&mut self, account: Address, root: [u8; 32]) -> Result<()> {
+            let caller = self.env().caller();
+            if !self.is_authorized_anchor(caller) {
+                return Err(Error::NotAuthorizedAnchor);
+            }
+
+            self.roots.insert(account, &root);
+
+            self.env().emit_event(RootUpdated { account, root });
+
+            Ok(())
+        }
+
+        /// Get the Merkle root for a user's attributes.
+        #[ink(message)]
+        pub fn get_root(&self, account: Address) -> Option<[u8; 32]> {
+            self.roots.get(account)
+        }
+
+        /// Add an authorized anchor (identity provider).
+        /// Only the contract owner can call this.
+        #[ink(message)]
+        pub fn add_anchor(&mut self, anchor: Address) -> Result<()> {
+            if self.env().caller() != self.owner {
+                return Err(Error::NotOwner);
+            }
+
+            self.authorized_anchors.insert(anchor, &true);
+
+            self.env().emit_event(AnchorAdded { anchor });
+
+            Ok(())
+        }
+
+        /// Remove an authorized anchor.
+        /// Only the contract owner can call this.
+        #[ink(message)]
+        pub fn remove_anchor(&mut self, anchor: Address) -> Result<()> {
+            if self.env().caller() != self.owner {
+                return Err(Error::NotOwner);
+            }
+
+            self.authorized_anchors.remove(anchor);
+
+            self.env().emit_event(AnchorRemoved { anchor });
+
+            Ok(())
+        }
+
+        /// Check if an address is an authorized anchor.
+        #[ink(message)]
+        pub fn is_authorized_anchor(&self, anchor: Address) -> bool {
+            // Owner is always an authorized anchor
+            if anchor == self.owner {
+                return true;
+            }
+            self.authorized_anchors.get(anchor).unwrap_or(false)
+        }
     }
 
     #[cfg(test)]
@@ -227,14 +319,16 @@ mod attribute_store {
             let mut contract = AttributeStore::new();
             let account = Address::from([0x01; 20]);
 
-            assert!(contract
-                .set_attribute(
-                    account,
-                    String::from("opentdf"),
-                    String::from("role"),
-                    String::from("admin")
-                )
-                .is_ok());
+            assert!(
+                contract
+                    .set_attribute(
+                        account,
+                        String::from("opentdf"),
+                        String::from("role"),
+                        String::from("admin")
+                    )
+                    .is_ok()
+            );
 
             assert_eq!(
                 contract.get_attribute(account, String::from("opentdf"), String::from("role")),
@@ -256,9 +350,11 @@ mod attribute_store {
                 )
                 .unwrap();
 
-            assert!(contract
-                .remove_attribute(account, String::from("opentdf"), String::from("role"))
-                .is_ok());
+            assert!(
+                contract
+                    .remove_attribute(account, String::from("opentdf"), String::from("role"))
+                    .is_ok()
+            );
 
             assert_eq!(
                 contract.get_attribute(account, String::from("opentdf"), String::from("role")),
@@ -276,6 +372,103 @@ mod attribute_store {
             contract.authorize_writer(writer);
             // Writer should be able to write to the caller's account
             assert!(contract.can_write(writer, caller));
+        }
+
+        #[ink::test]
+        fn set_root_works() {
+            let mut contract = AttributeStore::new();
+            let account = Address::from([0x01; 20]);
+            let root = [0xAB; 32];
+
+            // Owner is an authorized anchor by default
+            assert!(contract.set_root(account, root).is_ok());
+            assert_eq!(contract.get_root(account), Some(root));
+        }
+
+        #[ink::test]
+        fn set_root_fails_for_unauthorized() {
+            let mut contract = AttributeStore::new();
+            let account = Address::from([0x01; 20]);
+            let root = [0xAB; 32];
+
+            // Change caller to non-owner
+            ink::env::test::set_caller(Address::from([0x99; 20]));
+
+            assert_eq!(
+                contract.set_root(account, root),
+                Err(Error::NotAuthorizedAnchor)
+            );
+        }
+
+        #[ink::test]
+        fn add_anchor_works() {
+            let mut contract = AttributeStore::new();
+            let anchor = Address::from([0x02; 20]);
+
+            assert!(contract.add_anchor(anchor).is_ok());
+            assert!(contract.is_authorized_anchor(anchor));
+        }
+
+        #[ink::test]
+        fn authorized_anchor_can_set_root() {
+            let mut contract = AttributeStore::new();
+            let anchor = Address::from([0x02; 20]);
+            let account = Address::from([0x01; 20]);
+            let root = [0xCD; 32];
+
+            // Owner adds anchor
+            contract.add_anchor(anchor).unwrap();
+
+            // Switch caller to anchor
+            ink::env::test::set_caller(anchor);
+
+            // Anchor can set root
+            assert!(contract.set_root(account, root).is_ok());
+            assert_eq!(contract.get_root(account), Some(root));
+        }
+
+        #[ink::test]
+        fn remove_anchor_works() {
+            let mut contract = AttributeStore::new();
+            let anchor = Address::from([0x02; 20]);
+
+            contract.add_anchor(anchor).unwrap();
+            assert!(contract.is_authorized_anchor(anchor));
+
+            contract.remove_anchor(anchor).unwrap();
+            assert!(!contract.is_authorized_anchor(anchor));
+        }
+
+        #[ink::test]
+        fn get_root_returns_none_for_unknown() {
+            let contract = AttributeStore::new();
+            let account = Address::from([0x99; 20]);
+            assert!(contract.get_root(account).is_none());
+        }
+
+        #[ink::test]
+        fn add_anchor_fails_for_non_owner() {
+            let mut contract = AttributeStore::new();
+            let anchor = Address::from([0x02; 20]);
+
+            // Change caller to non-owner
+            ink::env::test::set_caller(Address::from([0x99; 20]));
+
+            assert_eq!(contract.add_anchor(anchor), Err(Error::NotOwner));
+        }
+
+        #[ink::test]
+        fn remove_anchor_fails_for_non_owner() {
+            let mut contract = AttributeStore::new();
+            let anchor = Address::from([0x02; 20]);
+
+            // Owner adds anchor first
+            contract.add_anchor(anchor).unwrap();
+
+            // Change caller to non-owner
+            ink::env::test::set_caller(Address::from([0x99; 20]));
+
+            assert_eq!(contract.remove_anchor(anchor), Err(Error::NotOwner));
         }
     }
 }
