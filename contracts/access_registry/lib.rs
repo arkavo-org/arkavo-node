@@ -84,9 +84,9 @@ mod access_registry {
         sessions: Mapping<[u8; 32], SessionGrant>,
         /// Contract owner who can grant/revoke entitlements
         owner: Address,
-        /// Reference to attribute_store contract for Merkle root lookups
+        /// Reference to `attribute_store` contract for Merkle root lookups
         attribute_store: Option<Address>,
-        /// Scope requirements: scope_id -> required attribute hashes
+        /// Scope requirements: `scope_id` -> required attribute hashes
         scope_requirements: Mapping<[u8; 32], ScopeRequirement>,
     }
 
@@ -299,7 +299,7 @@ mod access_registry {
             }
         }
 
-        /// Set the attribute_store contract address.
+        /// Set the `attribute_store` contract address.
         ///
         /// Only the contract owner can configure this.
         #[ink(message)]
@@ -311,7 +311,7 @@ mod access_registry {
             Ok(())
         }
 
-        /// Get the attribute_store contract address.
+        /// Get the `attribute_store` contract address.
         #[ink(message)]
         pub fn get_attribute_store(&self) -> Option<Address> {
             self.attribute_store
@@ -351,14 +351,15 @@ mod access_registry {
         /// Request a session by proving attributes via Merkle proofs.
         ///
         /// The caller provides their attribute root and proofs. The contract:
-        /// 1. Verifies attribute_store is configured
+        /// 1. Verifies `attribute_store` is configured
         /// 2. Validates each proof against the provided root
         /// 3. Checks all required attributes for the scope are proven
         /// 4. Creates and returns the session
         ///
         /// Note: In a full implementation, the root would be fetched via
-        /// cross-contract call to attribute_store.get_root(caller).
+        /// cross-contract call to `attribute_store.get_root(caller)`.
         #[ink(message)]
+        #[allow(clippy::needless_pass_by_value)]
         pub fn request_session(
             &mut self,
             eph_pub_key: ink::prelude::vec::Vec<u8>,
@@ -395,7 +396,7 @@ mod access_registry {
                     .find(|p| &p.attribute_hash == required_hash)
                     .ok_or(Error::MissingRequiredAttribute)?;
 
-                if !self.verify_merkle_proof(
+                if !Self::verify_merkle_proof(
                     &proof.attribute_hash,
                     &proof.proof_path,
                     &proof.proof_indices,
@@ -434,7 +435,6 @@ mod access_registry {
         ///
         /// Returns true if the proof path from leaf to root is valid.
         fn verify_merkle_proof(
-            &self,
             leaf: &[u8; 32],
             proof_path: &[[u8; 32]],
             proof_indices: &[u8],
@@ -618,8 +618,6 @@ mod access_registry {
 
         #[ink::test]
         fn verify_merkle_proof_works() {
-            let contract = AccessRegistry::new();
-
             // Build a simple 2-leaf Merkle tree
             // Leaves: [A, B]
             // Root: H(A || B)
@@ -639,11 +637,21 @@ mod access_registry {
             let proof_path = ink::prelude::vec![leaf_b];
             let proof_indices = ink::prelude::vec![0u8];
 
-            assert!(contract.verify_merkle_proof(&leaf_a, &proof_path, &proof_indices, &root));
+            assert!(AccessRegistry::verify_merkle_proof(
+                &leaf_a,
+                &proof_path,
+                &proof_indices,
+                &root
+            ));
 
             // Invalid proof should fail
             let wrong_leaf = [0x99u8; 32];
-            assert!(!contract.verify_merkle_proof(&wrong_leaf, &proof_path, &proof_indices, &root));
+            assert!(!AccessRegistry::verify_merkle_proof(
+                &wrong_leaf,
+                &proof_path,
+                &proof_indices,
+                &root
+            ));
         }
 
         #[ink::test]
