@@ -49,6 +49,12 @@ sp-runtime = { workspace = true, default-features = true }
 sp-timestamp = { workspace = true, default-features = true }
 substrate-frame-rpc-system = { workspace = true, default-features = true }
 
+# JWT verification for AuthnZ integration
+jsonwebtoken = { workspace = true }
+serde = { workspace = true, default-features = true }
+serde_json = { workspace = true, default-features = true }
+log = "0.4"
+
 [build-dependencies]
 substrate-build-script-utils = { workspace = true, default-features = true }
 
