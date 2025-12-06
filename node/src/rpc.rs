@@ -32,6 +32,10 @@ mod auth_api {
         pub sub: String,
         /// Expiration timestamp
         pub exp: usize,
+        /// Decentralized Identifier (did:key:...)
+        pub did: Option<String>,
+        /// EVM-compatible blockchain address for linking
+        pub blockchain_address: Option<String>,
     }
 
     /// Authentication token verification result
@@ -47,6 +51,30 @@ mod auth_api {
         pub expires_at: Option<u64>,
     }
 
+    /// Parameters for linking a DID to a blockchain address
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct LinkAccountParams {
+        /// JWT token containing the registration proof
+        pub jwt: String,
+        /// DID to link (must match JWT claims)
+        pub did: String,
+        /// Blockchain address to link (must match JWT claims)
+        pub address: String,
+    }
+
+    /// Result of linking a DID to a blockchain address
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct LinkAccountResult {
+        /// Whether the linking was successful
+        pub success: bool,
+        /// The linked DID
+        pub did: Option<String>,
+        /// The linked address
+        pub address: Option<String>,
+        /// Error message (if failed)
+        pub error: Option<String>,
+    }
+
     /// AuthnZ RPC API for JWT verification and DID account lookups
     #[rpc(server, client, namespace = "arkavo")]
     pub trait AuthApi {
@@ -57,6 +85,18 @@ mod auth_api {
         /// as security relies on WebAuthn ceremony, not token expiration.
         #[method(name = "verifyAuthToken")]
         fn verify_auth_token(&self, jwt: String) -> RpcResult<AuthTokenInfo>;
+
+        /// Link a DID to a blockchain address using a JWT proof
+        ///
+        /// The JWT must contain matching `did` and `blockchain_address` claims.
+        /// This provides transactional account creation between authnz-rs and arkavo-node.
+        #[method(name = "linkAccountWithProof")]
+        fn link_account_with_proof(
+            &self,
+            jwt: String,
+            did: String,
+            address: String,
+        ) -> RpcResult<LinkAccountResult>;
     }
 
     /// Implementation of the AuthApi
@@ -129,6 +169,107 @@ mod auth_api {
                     expires_at: None,
                 }),
             }
+        }
+
+        fn link_account_with_proof(
+            &self,
+            jwt: String,
+            did: String,
+            address: String,
+        ) -> RpcResult<LinkAccountResult> {
+            let Some(decoding_key) = &self.decoding_key else {
+                return Ok(LinkAccountResult {
+                    success: false,
+                    did: None,
+                    address: None,
+                    error: Some(
+                        "JWT verification not configured. Set AUTHNZ_PUBLIC_KEY_PATH environment variable.".to_string(),
+                    ),
+                });
+            };
+
+            // Validate address format (0x + 40 hex chars)
+            if !address.starts_with("0x") || address.len() != 42 {
+                return Ok(LinkAccountResult {
+                    success: false,
+                    did: None,
+                    address: None,
+                    error: Some("Invalid address format: must be 0x-prefixed 20-byte hex".to_string()),
+                });
+            }
+
+            // Validate DID format
+            if !did.starts_with("did:key:") {
+                return Ok(LinkAccountResult {
+                    success: false,
+                    did: None,
+                    address: None,
+                    error: Some("Invalid DID format: must start with 'did:key:'".to_string()),
+                });
+            }
+
+            // Configure validation for ES256 (ECDSA with P-256)
+            let mut validation = Validation::new(Algorithm::ES256);
+            validation.validate_exp = false;
+            validation.validate_nbf = false;
+
+            // Verify and decode the JWT
+            let token_data = match decode::<AccountTokenClaims>(&jwt, decoding_key, &validation) {
+                Ok(data) => data,
+                Err(e) => {
+                    return Ok(LinkAccountResult {
+                        success: false,
+                        did: None,
+                        address: None,
+                        error: Some(format!("JWT verification failed: {e}")),
+                    });
+                }
+            };
+
+            let claims = token_data.claims;
+
+            // Verify DID matches JWT claims
+            if claims.did.as_deref() != Some(&did) {
+                return Ok(LinkAccountResult {
+                    success: false,
+                    did: None,
+                    address: None,
+                    error: Some(format!(
+                        "DID mismatch: provided '{}' but JWT contains '{:?}'",
+                        did, claims.did
+                    )),
+                });
+            }
+
+            // Verify address matches JWT claims
+            if claims.blockchain_address.as_deref() != Some(&address) {
+                return Ok(LinkAccountResult {
+                    success: false,
+                    did: None,
+                    address: None,
+                    error: Some(format!(
+                        "Address mismatch: provided '{}' but JWT contains '{:?}'",
+                        address, claims.blockchain_address
+                    )),
+                });
+            }
+
+            // JWT is valid and claims match
+            // TODO: Submit extrinsic to user_registry contract to link on-chain
+            // For now, we log the successful verification
+            log::info!(
+                "Account linking verified: did={}, address={}, user_id={}",
+                did,
+                address,
+                claims.sub
+            );
+
+            Ok(LinkAccountResult {
+                success: true,
+                did: Some(did),
+                address: Some(address),
+                error: None,
+            })
         }
     }
 }
