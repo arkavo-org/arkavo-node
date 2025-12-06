@@ -7,12 +7,517 @@
 
 use std::sync::Arc;
 
-use arkavo_runtime::{opaque::Block, AccountId, Balance, Nonce};
+use arkavo_runtime::{AccountId, Balance, Nonce, opaque::Block};
 use jsonrpsee::RpcModule;
 use sc_transaction_pool_api::TransactionPool;
 use sp_api::ProvideRuntimeApi;
 use sp_block_builder::BlockBuilder;
 use sp_blockchain::{Error as BlockChainError, HeaderBackend, HeaderMetadata};
+
+pub use auth_api::AuthApiServer;
+
+/// Authentication API module for DID-to-account linking
+/// Note: This is a secured backchannel RPC - no token verification needed
+mod auth_api {
+    use super::*;
+    use jsonrpsee::{core::RpcResult, proc_macros::rpc};
+    use pallet_revive::{H160, ReviveApi};
+    use serde::{Deserialize, Serialize};
+    use sp_core::crypto::Ss58Codec;
+
+    /// Result of linking a DID to a blockchain address
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct LinkAccountResult {
+        /// Whether the linking was successful
+        pub success: bool,
+        /// The linked DID
+        pub did: Option<String>,
+        /// The linked address
+        pub address: Option<String>,
+        /// The user ID from authnz-rs
+        pub user_id: Option<String>,
+        /// Error message (if failed)
+        pub error: Option<String>,
+        /// Error code for programmatic handling (e.g., "DID_ALREADY_LINKED")
+        pub error_code: Option<String>,
+    }
+
+    /// Configuration for user registry contract
+    #[derive(Clone)]
+    pub struct UserRegistryConfig {
+        /// The deployed user_registry contract address (H160)
+        pub contract_address: H160,
+        /// The account that owns the contract (can call link_account_for)
+        pub owner_account: AccountId,
+    }
+
+    /// AuthnZ RPC API for DID account linking (secured backchannel)
+    #[rpc(server, client, namespace = "arkavo")]
+    pub trait AuthApi {
+        /// Link a DID to a blockchain address
+        ///
+        /// This is a secured backchannel RPC called by authnz-rs after successful
+        /// WebAuthn registration. No token verification is performed as the
+        /// channel is already secured.
+        ///
+        /// # Arguments
+        /// * `user_id` - User UUID from authnz-rs
+        /// * `did` - Decentralized Identifier (must start with "did:key:")
+        /// * `address` - EVM-compatible blockchain address (0x-prefixed, 20 bytes hex)
+        #[method(name = "linkAccountWithProof")]
+        fn link_account_with_proof(
+            &self,
+            user_id: String,
+            did: String,
+            address: String,
+        ) -> RpcResult<LinkAccountResult>;
+    }
+
+    /// Implementation of the AuthApi (secured backchannel - no token verification)
+    pub struct AuthApiImpl<C> {
+        /// Substrate client for runtime API calls
+        client: Arc<C>,
+        /// Optional user registry configuration
+        config: Option<UserRegistryConfig>,
+    }
+
+    impl<C> AuthApiImpl<C> {
+        /// Create a new AuthApi instance with client and optional contract config
+        pub fn new(client: Arc<C>, config: Option<UserRegistryConfig>) -> Self {
+            Self { client, config }
+        }
+    }
+
+    /// Encode ink! contract call for `link_account_for(did: String, account: Address)`
+    ///
+    /// Ink! message encoding format:
+    /// - 4 bytes: selector (blake2b hash of "link_account_for" truncated to 4 bytes)
+    /// - SCALE-encoded arguments
+    fn encode_link_account_for(did: &str, account: H160) -> Vec<u8> {
+        use parity_scale_codec::Encode;
+
+        // Ink! selector for "link_account_for" - computed as blake2b("link_account_for")[0..4]
+        // Using ink!'s selector computation: blake2b_256("link_account_for")[0..4]
+        let selector: [u8; 4] = {
+            use sp_core::hashing::blake2_256;
+            let hash = blake2_256(b"link_account_for");
+            [hash[0], hash[1], hash[2], hash[3]]
+        };
+
+        let mut encoded = selector.to_vec();
+        // Encode the DID string (SCALE: length-prefixed bytes)
+        encoded.extend(did.encode());
+        // Encode the H160 address (SCALE: 20 bytes, fixed size)
+        encoded.extend(account.encode());
+
+        encoded
+    }
+
+    /// Parse H160 address from hex string (0x-prefixed)
+    fn parse_h160(address: &str) -> Result<H160, String> {
+        if !address.starts_with("0x") || address.len() != 42 {
+            return Err("Invalid address format: must be 0x-prefixed 20-byte hex".to_string());
+        }
+
+        let bytes =
+            hex::decode(&address[2..]).map_err(|e| format!("Invalid hex in address: {}", e))?;
+
+        if bytes.len() != 20 {
+            return Err("Address must be exactly 20 bytes".to_string());
+        }
+
+        let mut arr = [0u8; 20];
+        arr.copy_from_slice(&bytes);
+        Ok(H160::from(arr))
+    }
+
+    impl<C> AuthApiServer for AuthApiImpl<C>
+    where
+        C: ProvideRuntimeApi<Block>,
+        C: HeaderBackend<Block> + 'static,
+        C: Send + Sync + 'static,
+        C::Api: pallet_revive::ReviveApi<Block, AccountId, Balance, Nonce, u32>,
+    {
+        fn link_account_with_proof(
+            &self,
+            user_id: String,
+            did: String,
+            address: String,
+        ) -> RpcResult<LinkAccountResult> {
+            // Validate user_id is a valid UUID
+            if uuid::Uuid::parse_str(&user_id).is_err() {
+                return Ok(LinkAccountResult {
+                    success: false,
+                    did: None,
+                    address: None,
+                    user_id: None,
+                    error: Some("Invalid user_id: must be a valid UUID".to_string()),
+                    error_code: Some("INVALID_UUID".to_string()),
+                });
+            }
+
+            // Validate and parse address
+            let target_address = match parse_h160(&address) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    return Ok(LinkAccountResult {
+                        success: false,
+                        did: None,
+                        address: None,
+                        user_id: None,
+                        error: Some(e),
+                        error_code: Some("INVALID_ADDRESS".to_string()),
+                    });
+                }
+            };
+
+            // Validate DID format
+            if !did.starts_with("did:key:") {
+                return Ok(LinkAccountResult {
+                    success: false,
+                    did: None,
+                    address: None,
+                    user_id: None,
+                    error: Some("Invalid DID format: must start with 'did:key:'".to_string()),
+                    error_code: Some("INVALID_DID_FORMAT".to_string()),
+                });
+            }
+
+            // Check if contract is configured
+            let Some(config) = &self.config else {
+                log::warn!(
+                    "Account linking requested but USER_REGISTRY_ADDRESS not configured. \
+                     user_id={}, did={}, address={}",
+                    user_id,
+                    did,
+                    address
+                );
+                return Ok(LinkAccountResult {
+                    success: false,
+                    did: Some(did),
+                    address: Some(address),
+                    user_id: Some(user_id),
+                    error: Some(
+                        "User registry contract not configured. Set USER_REGISTRY_ADDRESS and USER_REGISTRY_OWNER environment variables.".to_string()
+                    ),
+                    error_code: Some("CONTRACT_NOT_CONFIGURED".to_string()),
+                });
+            };
+
+            // Encode the contract call
+            let input_data = encode_link_account_for(&did, target_address);
+
+            // Get the best block hash for the runtime API call
+            let at = self.client.info().best_hash;
+
+            // Call the contract via runtime API
+            let result = self.client.runtime_api().call(
+                at,
+                config.owner_account.clone(),
+                config.contract_address,
+                0,    // No value transfer
+                None, // Default gas limit
+                None, // Default storage deposit limit
+                input_data,
+            );
+
+            match result {
+                Ok(contract_result) => {
+                    // Check if the contract call succeeded
+                    match contract_result.result {
+                        Ok(exec_result) => {
+                            // Check the return flags - empty means success
+                            if exec_result.flags.is_empty() {
+                                log::info!(
+                                    "Account linked on-chain: user_id={}, did={}, address={}",
+                                    user_id,
+                                    did,
+                                    address
+                                );
+                                Ok(LinkAccountResult {
+                                    success: true,
+                                    did: Some(did),
+                                    address: Some(address),
+                                    user_id: Some(user_id),
+                                    error: None,
+                                    error_code: None,
+                                })
+                            } else {
+                                // Contract returned an error
+                                let contract_error = decode_contract_error(&exec_result.data);
+                                log::error!(
+                                    "Contract call failed: user_id={}, did={}, address={}, error={}",
+                                    user_id,
+                                    did,
+                                    address,
+                                    contract_error.message
+                                );
+                                Ok(LinkAccountResult {
+                                    success: false,
+                                    did: Some(did),
+                                    address: Some(address),
+                                    user_id: Some(user_id),
+                                    error: Some(contract_error.message),
+                                    error_code: Some(contract_error.code),
+                                })
+                            }
+                        }
+                        Err(error) => {
+                            log::error!(
+                                "Contract execution failed: user_id={}, did={}, address={}, error={:?}",
+                                user_id,
+                                did,
+                                address,
+                                error
+                            );
+                            Ok(LinkAccountResult {
+                                success: false,
+                                did: Some(did),
+                                address: Some(address),
+                                user_id: Some(user_id),
+                                error: Some(format!("Contract execution failed: {:?}", error)),
+                                error_code: Some("CONTRACT_EXECUTION_FAILED".to_string()),
+                            })
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!(
+                        "Runtime API call failed: user_id={}, did={}, address={}, error={}",
+                        user_id,
+                        did,
+                        address,
+                        e
+                    );
+                    Ok(LinkAccountResult {
+                        success: false,
+                        did: Some(did),
+                        address: Some(address),
+                        user_id: Some(user_id),
+                        error: Some(format!("Runtime API error: {}", e)),
+                        error_code: Some("RUNTIME_ERROR".to_string()),
+                    })
+                }
+            }
+        }
+    }
+
+    /// Decoded contract error with both human-readable message and machine-readable code
+    struct ContractError {
+        message: String,
+        code: String,
+    }
+
+    /// Decode contract error from return data
+    /// The user_registry contract returns SCALE-encoded Error enum
+    fn decode_contract_error(data: &[u8]) -> ContractError {
+        // Try to decode as our Error enum variant index
+        if data.is_empty() {
+            return ContractError {
+                message: "Unknown contract error (empty data)".to_string(),
+                code: "CONTRACT_ERROR".to_string(),
+            };
+        }
+
+        // The first byte is the enum variant index
+        match data[0] {
+            0 => ContractError {
+                message: "DID is already linked to another account".to_string(),
+                code: "DID_ALREADY_LINKED".to_string(),
+            },
+            1 => ContractError {
+                message: "Account is already linked to a DID".to_string(),
+                code: "ACCOUNT_ALREADY_LINKED".to_string(),
+            },
+            2 => ContractError {
+                message: "Invalid DID format".to_string(),
+                code: "INVALID_DID_FORMAT".to_string(),
+            },
+            3 => ContractError {
+                message: "Empty DID".to_string(),
+                code: "EMPTY_DID".to_string(),
+            },
+            4 => ContractError {
+                message: "Not the contract owner".to_string(),
+                code: "NOT_OWNER".to_string(),
+            },
+            5 => ContractError {
+                message: "DID exceeds maximum length".to_string(),
+                code: "DID_TOO_LONG".to_string(),
+            },
+            _ => ContractError {
+                message: format!("Unknown contract error (code: {})", data[0]),
+                code: "CONTRACT_ERROR".to_string(),
+            },
+        }
+    }
+
+    /// Load user registry configuration from environment
+    pub fn load_config_from_env() -> Option<UserRegistryConfig> {
+        let contract_address_str = std::env::var("USER_REGISTRY_ADDRESS").ok()?;
+        let owner_account_str = std::env::var("USER_REGISTRY_OWNER").ok()?;
+
+        // Parse contract address (0x-prefixed H160)
+        let contract_address = match parse_h160(&contract_address_str) {
+            Ok(addr) => addr,
+            Err(e) => {
+                log::error!("Invalid USER_REGISTRY_ADDRESS: {}", e);
+                return None;
+            }
+        };
+
+        // Parse owner account (SS58 format)
+        let owner_account = match AccountId::from_ss58check(&owner_account_str) {
+            Ok(account) => account,
+            Err(e) => {
+                log::error!(
+                    "Invalid USER_REGISTRY_OWNER (expected SS58 format): {:?}",
+                    e
+                );
+                return None;
+            }
+        };
+
+        log::info!(
+            "User registry configured: contract={}, owner={}",
+            contract_address_str,
+            owner_account_str
+        );
+
+        Some(UserRegistryConfig {
+            contract_address,
+            owner_account,
+        })
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn encode_link_account_for_produces_correct_selector() {
+            let did = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+            let address = H160::from([0x12; 20]);
+
+            let encoded = encode_link_account_for(did, address);
+
+            // Selector for "link_account_for" is 0x032efef7 (verified against contract metadata)
+            assert_eq!(&encoded[0..4], &[0x03, 0x2e, 0xfe, 0xf7]);
+        }
+
+        #[test]
+        fn encode_link_account_for_includes_scale_encoded_args() {
+            let did = "did:key:test";
+            let address = H160::from([0xAB; 20]);
+
+            let encoded = encode_link_account_for(did, address);
+
+            // After 4-byte selector, should have SCALE-encoded string (length-prefixed)
+            // "did:key:test" is 12 bytes, SCALE compact encoding for 12 is 0x30 (12 << 2)
+            assert_eq!(encoded[4], 0x30); // Compact length prefix for 12 bytes
+
+            // String content follows
+            assert_eq!(&encoded[5..17], b"did:key:test");
+
+            // Then 20-byte address
+            assert_eq!(&encoded[17..37], &[0xAB; 20]);
+        }
+
+        #[test]
+        fn parse_h160_valid_address() {
+            let addr_str = "0x1234567890abcdef1234567890abcdef12345678";
+            let result = parse_h160(addr_str);
+
+            assert!(result.is_ok());
+            let h160 = result.unwrap();
+            assert_eq!(
+                h160.as_bytes(),
+                &[
+                    0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90,
+                    0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78
+                ]
+            );
+        }
+
+        #[test]
+        fn parse_h160_rejects_missing_prefix() {
+            let addr_str = "1234567890abcdef1234567890abcdef12345678";
+            let result = parse_h160(addr_str);
+
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("0x-prefixed"));
+        }
+
+        #[test]
+        fn parse_h160_rejects_invalid_length_short() {
+            let addr_str = "0x1234";
+            let result = parse_h160(addr_str);
+
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("0x-prefixed 20-byte"));
+        }
+
+        #[test]
+        fn parse_h160_rejects_invalid_length_long() {
+            let addr_str = "0x1234567890abcdef1234567890abcdef1234567890";
+            let result = parse_h160(addr_str);
+
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn parse_h160_rejects_invalid_hex() {
+            let addr_str = "0xGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG";
+            let result = parse_h160(addr_str);
+
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("Invalid hex"));
+        }
+
+        #[test]
+        fn decode_contract_error_all_variants() {
+            let err0 = decode_contract_error(&[0]);
+            assert_eq!(err0.message, "DID is already linked to another account");
+            assert_eq!(err0.code, "DID_ALREADY_LINKED");
+
+            let err1 = decode_contract_error(&[1]);
+            assert_eq!(err1.message, "Account is already linked to a DID");
+            assert_eq!(err1.code, "ACCOUNT_ALREADY_LINKED");
+
+            let err2 = decode_contract_error(&[2]);
+            assert_eq!(err2.message, "Invalid DID format");
+            assert_eq!(err2.code, "INVALID_DID_FORMAT");
+
+            let err3 = decode_contract_error(&[3]);
+            assert_eq!(err3.message, "Empty DID");
+            assert_eq!(err3.code, "EMPTY_DID");
+
+            let err4 = decode_contract_error(&[4]);
+            assert_eq!(err4.message, "Not the contract owner");
+            assert_eq!(err4.code, "NOT_OWNER");
+
+            let err5 = decode_contract_error(&[5]);
+            assert_eq!(err5.message, "DID exceeds maximum length");
+            assert_eq!(err5.code, "DID_TOO_LONG");
+        }
+
+        #[test]
+        fn decode_contract_error_unknown_variant() {
+            let result = decode_contract_error(&[99]);
+            assert!(result.message.contains("Unknown contract error"));
+            assert!(result.message.contains("99"));
+            assert_eq!(result.code, "CONTRACT_ERROR");
+        }
+
+        #[test]
+        fn decode_contract_error_empty_data() {
+            let result = decode_contract_error(&[]);
+            assert_eq!(result.message, "Unknown contract error (empty data)");
+            assert_eq!(result.code, "CONTRACT_ERROR");
+        }
+    }
+}
 
 /// Full client dependencies.
 pub struct FullDeps<C, P> {
@@ -32,6 +537,7 @@ where
     C: Send + Sync + 'static,
     C::Api: substrate_frame_rpc_system::AccountNonceApi<Block, AccountId, Nonce>,
     C::Api: pallet_transaction_payment_rpc::TransactionPaymentRuntimeApi<Block, Balance>,
+    C::Api: pallet_revive::ReviveApi<Block, AccountId, Balance, Nonce, u32>,
     C::Api: BlockBuilder<Block>,
     P: TransactionPool + 'static,
 {
@@ -42,19 +548,14 @@ where
     let FullDeps { client, pool } = deps;
 
     module.merge(System::new(client.clone(), pool).into_rpc())?;
-    module.merge(TransactionPayment::new(client).into_rpc())?;
+    module.merge(TransactionPayment::new(client.clone()).into_rpc())?;
 
-    // Extend this RPC with a custom API by using the following syntax.
-    // `YourRpcStruct` should have a reference to a client, which is needed
-    // to call into the runtime.
-    // `module.merge(YourRpcTrait::into_rpc(YourRpcStruct::new(ReferenceToClient, ...)))?;`
+    // Load user registry config from environment
+    let user_registry_config = auth_api::load_config_from_env();
 
-    // You probably want to enable the `rpc v2 chainSpec` API as well
-    //
-    // let chain_name = chain_spec.name().to_string();
-    // let genesis_hash = client.block_hash(0).ok().flatten().expect("Genesis block exists; qed");
-    // let properties = chain_spec.properties();
-    // module.merge(ChainSpec::new(chain_name, genesis_hash, properties).into_rpc())?;
+    // Add AuthnZ API for DID account linking (secured backchannel)
+    let auth_api = auth_api::AuthApiImpl::new(client, user_registry_config);
+    module.merge(auth_api.into_rpc())?;
 
     Ok(module)
 }
