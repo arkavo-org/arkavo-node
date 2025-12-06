@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use arkavo_runtime::{opaque::Block, AccountId, Balance, Nonce};
+use arkavo_runtime::{AccountId, Balance, Nonce, opaque::Block};
 use jsonrpsee::RpcModule;
 use sc_transaction_pool_api::TransactionPool;
 use sp_api::ProvideRuntimeApi;
@@ -16,51 +16,14 @@ use sp_blockchain::{Error as BlockChainError, HeaderBackend, HeaderMetadata};
 
 pub use auth_api::AuthApiServer;
 
-/// Authentication API module for JWT verification
+/// Authentication API module for DID-to-account linking
+/// Note: This is a secured backchannel RPC - no token verification needed
 mod auth_api {
+    use super::*;
     use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+    use pallet_revive::{H160, ReviveApi};
     use serde::{Deserialize, Serialize};
-    use std::sync::Arc;
-
-    /// JWT Claims for registration tokens (includes passkey data)
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct AccountTokenClaims {
-        /// User unique ID (UUID)
-        pub user_unique_id: Option<String>,
-        /// Subject (user_id as string)
-        pub sub: String,
-        /// Expiration timestamp
-        pub exp: usize,
-        /// Decentralized Identifier (did:key:...)
-        pub did: Option<String>,
-        /// EVM-compatible blockchain address for linking
-        pub blockchain_address: Option<String>,
-    }
-
-    /// Authentication token verification result
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct AuthTokenInfo {
-        /// Whether the token signature is valid
-        pub valid: bool,
-        /// User ID extracted from token (if valid)
-        pub user_id: Option<String>,
-        /// Error message (if invalid)
-        pub error: Option<String>,
-        /// Token expiration timestamp (if valid)
-        pub expires_at: Option<u64>,
-    }
-
-    /// Parameters for linking a DID to a blockchain address
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct LinkAccountParams {
-        /// JWT token containing the registration proof
-        pub jwt: String,
-        /// DID to link (must match JWT claims)
-        pub did: String,
-        /// Blockchain address to link (must match JWT claims)
-        pub address: String,
-    }
+    use sp_core::crypto::Ss58Codec;
 
     /// Result of linking a DID to a blockchain address
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,132 +34,138 @@ mod auth_api {
         pub did: Option<String>,
         /// The linked address
         pub address: Option<String>,
+        /// The user ID from authnz-rs
+        pub user_id: Option<String>,
         /// Error message (if failed)
         pub error: Option<String>,
     }
 
-    /// AuthnZ RPC API for JWT verification and DID account lookups
+    /// Configuration for user registry contract
+    #[derive(Clone)]
+    pub struct UserRegistryConfig {
+        /// The deployed user_registry contract address (H160)
+        pub contract_address: H160,
+        /// The account that owns the contract (can call link_account_for)
+        pub owner_account: AccountId,
+    }
+
+    /// AuthnZ RPC API for DID account linking (secured backchannel)
     #[rpc(server, client, namespace = "arkavo")]
     pub trait AuthApi {
-        /// Verify a JWT token from authnz-rs
+        /// Link a DID to a blockchain address
         ///
-        /// Returns token validity and extracted claims if valid.
-        /// Note: authnz-rs intentionally disables exp/nbf validation
-        /// as security relies on WebAuthn ceremony, not token expiration.
-        #[method(name = "verifyAuthToken")]
-        fn verify_auth_token(&self, jwt: String) -> RpcResult<AuthTokenInfo>;
-
-        /// Link a DID to a blockchain address using a JWT proof
+        /// This is a secured backchannel RPC called by authnz-rs after successful
+        /// WebAuthn registration. No token verification is performed as the
+        /// channel is already secured.
         ///
-        /// The JWT must contain matching `did` and `blockchain_address` claims.
-        /// This provides transactional account creation between authnz-rs and arkavo-node.
+        /// # Arguments
+        /// * `user_id` - User UUID from authnz-rs
+        /// * `did` - Decentralized Identifier (must start with "did:key:")
+        /// * `address` - EVM-compatible blockchain address (0x-prefixed, 20 bytes hex)
         #[method(name = "linkAccountWithProof")]
         fn link_account_with_proof(
             &self,
-            jwt: String,
+            user_id: String,
             did: String,
             address: String,
         ) -> RpcResult<LinkAccountResult>;
     }
 
-    /// Implementation of the AuthApi
-    pub struct AuthApiImpl {
-        /// Optional decoding key for JWT verification
-        /// If None, JWT verification will fail with configuration error
-        decoding_key: Option<Arc<DecodingKey>>,
+    /// Implementation of the AuthApi (secured backchannel - no token verification)
+    pub struct AuthApiImpl<C> {
+        /// Substrate client for runtime API calls
+        client: Arc<C>,
+        /// Optional user registry configuration
+        config: Option<UserRegistryConfig>,
     }
 
-    impl AuthApiImpl {
-        /// Create a new AuthApi instance without a decoding key
-        /// JWT verification will return an error until a key is configured
-        pub fn new() -> Self {
-            Self { decoding_key: None }
-        }
-
-        /// Create a new AuthApi instance with a PEM-encoded public key
-        ///
-        /// # Arguments
-        /// * `pem_key` - PEM-encoded EC public key for ES256 verification
-        pub fn with_pem_key(pem_key: &[u8]) -> Result<Self, String> {
-            let decoding_key = DecodingKey::from_ec_pem(pem_key)
-                .map_err(|e| format!("Failed to parse EC public key: {e}"))?;
-            Ok(Self {
-                decoding_key: Some(Arc::new(decoding_key)),
-            })
+    impl<C> AuthApiImpl<C> {
+        /// Create a new AuthApi instance with client and optional contract config
+        pub fn new(client: Arc<C>, config: Option<UserRegistryConfig>) -> Self {
+            Self { client, config }
         }
     }
 
-    impl Default for AuthApiImpl {
-        fn default() -> Self {
-            Self::new()
-        }
+    /// Encode ink! contract call for `link_account_for(did: String, account: Address)`
+    ///
+    /// Ink! message encoding format:
+    /// - 4 bytes: selector (blake2b hash of "link_account_for" truncated to 4 bytes)
+    /// - SCALE-encoded arguments
+    fn encode_link_account_for(did: &str, account: H160) -> Vec<u8> {
+        use parity_scale_codec::Encode;
+
+        // Ink! selector for "link_account_for" - computed as blake2b("link_account_for")[0..4]
+        // Using ink!'s selector computation: blake2b_256("link_account_for")[0..4]
+        let selector: [u8; 4] = {
+            use sp_core::hashing::blake2_256;
+            let hash = blake2_256(b"link_account_for");
+            [hash[0], hash[1], hash[2], hash[3]]
+        };
+
+        let mut encoded = selector.to_vec();
+        // Encode the DID string (SCALE: length-prefixed bytes)
+        encoded.extend(did.encode());
+        // Encode the H160 address (SCALE: 20 bytes, fixed size)
+        encoded.extend(account.encode());
+
+        encoded
     }
 
-    impl AuthApiServer for AuthApiImpl {
-        fn verify_auth_token(&self, jwt: String) -> RpcResult<AuthTokenInfo> {
-            let Some(decoding_key) = &self.decoding_key else {
-                return Ok(AuthTokenInfo {
-                    valid: false,
-                    user_id: None,
-                    error: Some(
-                        "JWT verification not configured. Set AUTHNZ_PUBLIC_KEY_PATH environment variable.".to_string(),
-                    ),
-                    expires_at: None,
-                });
-            };
-
-            // Configure validation for ES256 (ECDSA with P-256)
-            // Note: authnz-rs intentionally disables exp/nbf validation
-            // Security relies on WebAuthn ceremony, not token expiration
-            let mut validation = Validation::new(Algorithm::ES256);
-            validation.validate_exp = false;
-            validation.validate_nbf = false;
-
-            match decode::<AccountTokenClaims>(&jwt, decoding_key, &validation) {
-                Ok(token_data) => {
-                    let claims = token_data.claims;
-                    Ok(AuthTokenInfo {
-                        valid: true,
-                        user_id: Some(claims.sub.clone()),
-                        error: None,
-                        expires_at: Some(claims.exp as u64),
-                    })
-                }
-                Err(e) => Ok(AuthTokenInfo {
-                    valid: false,
-                    user_id: None,
-                    error: Some(format!("Token verification failed: {e}")),
-                    expires_at: None,
-                }),
-            }
+    /// Parse H160 address from hex string (0x-prefixed)
+    fn parse_h160(address: &str) -> Result<H160, String> {
+        if !address.starts_with("0x") || address.len() != 42 {
+            return Err("Invalid address format: must be 0x-prefixed 20-byte hex".to_string());
         }
 
+        let bytes =
+            hex::decode(&address[2..]).map_err(|e| format!("Invalid hex in address: {}", e))?;
+
+        if bytes.len() != 20 {
+            return Err("Address must be exactly 20 bytes".to_string());
+        }
+
+        let mut arr = [0u8; 20];
+        arr.copy_from_slice(&bytes);
+        Ok(H160::from(arr))
+    }
+
+    impl<C> AuthApiServer for AuthApiImpl<C>
+    where
+        C: ProvideRuntimeApi<Block>,
+        C: HeaderBackend<Block> + 'static,
+        C: Send + Sync + 'static,
+        C::Api: pallet_revive::ReviveApi<Block, AccountId, Balance, Nonce, u32>,
+    {
         fn link_account_with_proof(
             &self,
-            jwt: String,
+            user_id: String,
             did: String,
             address: String,
         ) -> RpcResult<LinkAccountResult> {
-            let Some(decoding_key) = &self.decoding_key else {
+            // Validate user_id is a valid UUID
+            if uuid::Uuid::parse_str(&user_id).is_err() {
                 return Ok(LinkAccountResult {
                     success: false,
                     did: None,
                     address: None,
-                    error: Some(
-                        "JWT verification not configured. Set AUTHNZ_PUBLIC_KEY_PATH environment variable.".to_string(),
-                    ),
-                });
-            };
-
-            // Validate address format (0x + 40 hex chars)
-            if !address.starts_with("0x") || address.len() != 42 {
-                return Ok(LinkAccountResult {
-                    success: false,
-                    did: None,
-                    address: None,
-                    error: Some("Invalid address format: must be 0x-prefixed 20-byte hex".to_string()),
+                    user_id: None,
+                    error: Some("Invalid user_id: must be a valid UUID".to_string()),
                 });
             }
+
+            // Validate and parse address
+            let target_address = match parse_h160(&address) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    return Ok(LinkAccountResult {
+                        success: false,
+                        did: None,
+                        address: None,
+                        user_id: None,
+                        error: Some(e),
+                    });
+                }
+            };
 
             // Validate DID format
             if !did.starts_with("did:key:") {
@@ -204,73 +173,180 @@ mod auth_api {
                     success: false,
                     did: None,
                     address: None,
+                    user_id: None,
                     error: Some("Invalid DID format: must start with 'did:key:'".to_string()),
                 });
             }
 
-            // Configure validation for ES256 (ECDSA with P-256)
-            let mut validation = Validation::new(Algorithm::ES256);
-            validation.validate_exp = false;
-            validation.validate_nbf = false;
-
-            // Verify and decode the JWT
-            let token_data = match decode::<AccountTokenClaims>(&jwt, decoding_key, &validation) {
-                Ok(data) => data,
-                Err(e) => {
-                    return Ok(LinkAccountResult {
-                        success: false,
-                        did: None,
-                        address: None,
-                        error: Some(format!("JWT verification failed: {e}")),
-                    });
-                }
+            // Check if contract is configured
+            let Some(config) = &self.config else {
+                log::warn!(
+                    "Account linking requested but USER_REGISTRY_ADDRESS not configured. \
+                     user_id={}, did={}, address={}",
+                    user_id,
+                    did,
+                    address
+                );
+                return Ok(LinkAccountResult {
+                    success: false,
+                    did: Some(did),
+                    address: Some(address),
+                    user_id: Some(user_id),
+                    error: Some(
+                        "User registry contract not configured. Set USER_REGISTRY_ADDRESS and USER_REGISTRY_OWNER environment variables.".to_string()
+                    ),
+                });
             };
 
-            let claims = token_data.claims;
+            // Encode the contract call
+            let input_data = encode_link_account_for(&did, target_address);
 
-            // Verify DID matches JWT claims
-            if claims.did.as_deref() != Some(&did) {
-                return Ok(LinkAccountResult {
-                    success: false,
-                    did: None,
-                    address: None,
-                    error: Some(format!(
-                        "DID mismatch: provided '{}' but JWT contains '{:?}'",
-                        did, claims.did
-                    )),
-                });
-            }
+            // Get the best block hash for the runtime API call
+            let at = self.client.info().best_hash;
 
-            // Verify address matches JWT claims
-            if claims.blockchain_address.as_deref() != Some(&address) {
-                return Ok(LinkAccountResult {
-                    success: false,
-                    did: None,
-                    address: None,
-                    error: Some(format!(
-                        "Address mismatch: provided '{}' but JWT contains '{:?}'",
-                        address, claims.blockchain_address
-                    )),
-                });
-            }
-
-            // JWT is valid and claims match
-            // TODO: Submit extrinsic to user_registry contract to link on-chain
-            // For now, we log the successful verification
-            log::info!(
-                "Account linking verified: did={}, address={}, user_id={}",
-                did,
-                address,
-                claims.sub
+            // Call the contract via runtime API
+            let result = self.client.runtime_api().call(
+                at,
+                config.owner_account.clone(),
+                config.contract_address,
+                0,    // No value transfer
+                None, // Default gas limit
+                None, // Default storage deposit limit
+                input_data,
             );
 
-            Ok(LinkAccountResult {
-                success: true,
-                did: Some(did),
-                address: Some(address),
-                error: None,
-            })
+            match result {
+                Ok(contract_result) => {
+                    // Check if the contract call succeeded
+                    match contract_result.result {
+                        Ok(exec_result) => {
+                            // Check the return flags - empty means success
+                            if exec_result.flags.is_empty() {
+                                log::info!(
+                                    "Account linked on-chain: user_id={}, did={}, address={}",
+                                    user_id,
+                                    did,
+                                    address
+                                );
+                                Ok(LinkAccountResult {
+                                    success: true,
+                                    did: Some(did),
+                                    address: Some(address),
+                                    user_id: Some(user_id),
+                                    error: None,
+                                })
+                            } else {
+                                // Contract returned an error
+                                let error_msg = decode_contract_error(&exec_result.data);
+                                log::error!(
+                                    "Contract call failed: user_id={}, did={}, address={}, error={}",
+                                    user_id,
+                                    did,
+                                    address,
+                                    error_msg
+                                );
+                                Ok(LinkAccountResult {
+                                    success: false,
+                                    did: Some(did),
+                                    address: Some(address),
+                                    user_id: Some(user_id),
+                                    error: Some(error_msg),
+                                })
+                            }
+                        }
+                        Err(error) => {
+                            log::error!(
+                                "Contract execution failed: user_id={}, did={}, address={}, error={:?}",
+                                user_id,
+                                did,
+                                address,
+                                error
+                            );
+                            Ok(LinkAccountResult {
+                                success: false,
+                                did: Some(did),
+                                address: Some(address),
+                                user_id: Some(user_id),
+                                error: Some(format!("Contract execution failed: {:?}", error)),
+                            })
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!(
+                        "Runtime API call failed: user_id={}, did={}, address={}, error={}",
+                        user_id,
+                        did,
+                        address,
+                        e
+                    );
+                    Ok(LinkAccountResult {
+                        success: false,
+                        did: Some(did),
+                        address: Some(address),
+                        user_id: Some(user_id),
+                        error: Some(format!("Runtime API error: {}", e)),
+                    })
+                }
+            }
         }
+    }
+
+    /// Decode contract error from return data
+    /// The user_registry contract returns SCALE-encoded Error enum
+    fn decode_contract_error(data: &[u8]) -> String {
+        // Try to decode as our Error enum variant index
+        if data.is_empty() {
+            return "Unknown contract error (empty data)".to_string();
+        }
+
+        // The first byte is the enum variant index
+        match data[0] {
+            0 => "DID is already linked to another account".to_string(),
+            1 => "Account is already linked to a DID".to_string(),
+            2 => "Invalid DID format".to_string(),
+            3 => "Empty DID".to_string(),
+            4 => "Not the contract owner".to_string(),
+            _ => format!("Unknown contract error (code: {})", data[0]),
+        }
+    }
+
+    /// Load user registry configuration from environment
+    pub fn load_config_from_env() -> Option<UserRegistryConfig> {
+        let contract_address_str = std::env::var("USER_REGISTRY_ADDRESS").ok()?;
+        let owner_account_str = std::env::var("USER_REGISTRY_OWNER").ok()?;
+
+        // Parse contract address (0x-prefixed H160)
+        let contract_address = match parse_h160(&contract_address_str) {
+            Ok(addr) => addr,
+            Err(e) => {
+                log::error!("Invalid USER_REGISTRY_ADDRESS: {}", e);
+                return None;
+            }
+        };
+
+        // Parse owner account (SS58 format)
+        let owner_account = match AccountId::from_ss58check(&owner_account_str) {
+            Ok(account) => account,
+            Err(e) => {
+                log::error!(
+                    "Invalid USER_REGISTRY_OWNER (expected SS58 format): {:?}",
+                    e
+                );
+                return None;
+            }
+        };
+
+        log::info!(
+            "User registry configured: contract={}, owner={}",
+            contract_address_str,
+            owner_account_str
+        );
+
+        Some(UserRegistryConfig {
+            contract_address,
+            owner_account,
+        })
     }
 }
 
@@ -280,8 +356,6 @@ pub struct FullDeps<C, P> {
     pub client: Arc<C>,
     /// Transaction pool instance.
     pub pool: Arc<P>,
-    /// Optional path to authnz-rs public key for JWT verification
-    pub authnz_public_key: Option<Vec<u8>>,
 }
 
 /// Instantiate all full RPC extensions.
@@ -294,6 +368,7 @@ where
     C: Send + Sync + 'static,
     C::Api: substrate_frame_rpc_system::AccountNonceApi<Block, AccountId, Nonce>,
     C::Api: pallet_transaction_payment_rpc::TransactionPaymentRuntimeApi<Block, Balance>,
+    C::Api: pallet_revive::ReviveApi<Block, AccountId, Balance, Nonce, u32>,
     C::Api: BlockBuilder<Block>,
     P: TransactionPool + 'static,
 {
@@ -301,27 +376,16 @@ where
     use substrate_frame_rpc_system::{System, SystemApiServer};
 
     let mut module = RpcModule::new(());
-    let FullDeps {
-        client,
-        pool,
-        authnz_public_key,
-    } = deps;
+    let FullDeps { client, pool } = deps;
 
     module.merge(System::new(client.clone(), pool).into_rpc())?;
-    module.merge(TransactionPayment::new(client).into_rpc())?;
+    module.merge(TransactionPayment::new(client.clone()).into_rpc())?;
 
-    // Add AuthnZ API for JWT verification
-    let auth_api = if let Some(key_bytes) = authnz_public_key {
-        auth_api::AuthApiImpl::with_pem_key(&key_bytes).unwrap_or_else(|e| {
-            log::warn!("Failed to initialize AuthApi with public key: {e}");
-            auth_api::AuthApiImpl::new()
-        })
-    } else {
-        log::info!(
-            "AuthnZ public key not configured. Set AUTHNZ_PUBLIC_KEY_PATH to enable JWT verification."
-        );
-        auth_api::AuthApiImpl::new()
-    };
+    // Load user registry config from environment
+    let user_registry_config = auth_api::load_config_from_env();
+
+    // Add AuthnZ API for DID account linking (secured backchannel)
+    let auth_api = auth_api::AuthApiImpl::new(client, user_registry_config);
     module.merge(auth_api.into_rpc())?;
 
     Ok(module)

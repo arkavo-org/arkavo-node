@@ -5,27 +5,12 @@ use futures::FutureExt;
 use sc_client_api::{Backend, BlockBackend};
 use sc_consensus_aura::{ImportQueueParams, SlotProportion, StartAuraParams};
 use sc_consensus_grandpa::SharedVoterState;
-use sc_service::{error::Error as ServiceError, Configuration, TaskManager, WarpSyncConfig};
+use sc_service::{Configuration, TaskManager, WarpSyncConfig, error::Error as ServiceError};
 use sc_telemetry::{Error as TelemetryError, Telemetry, TelemetryWorker};
 use sc_transaction_pool_api::OffchainTransactionPoolFactory;
 use sp_consensus_aura::sr25519::AuthorityPair as AuraPair;
 
-use std::{fs, sync::Arc, time::Duration};
-
-/// Load the authnz-rs public key from the environment variable path
-fn load_authnz_public_key() -> Option<Vec<u8>> {
-    let key_path = std::env::var("AUTHNZ_PUBLIC_KEY_PATH").ok()?;
-    match fs::read(&key_path) {
-        Ok(key_bytes) => {
-            log::info!("Loaded AuthnZ public key from: {}", key_path);
-            Some(key_bytes)
-        }
-        Err(e) => {
-            log::warn!("Failed to load AuthnZ public key from {}: {}", key_path, e);
-            None
-        }
-    }
-}
+use std::{sync::Arc, time::Duration};
 
 pub(crate) type FullClient = sc_service::TFullClient<
     Block,
@@ -244,19 +229,14 @@ pub fn new_full<
     let enable_grandpa = !config.disable_grandpa;
     let prometheus_registry = config.prometheus_registry().cloned();
 
-    // Load authnz-rs public key for JWT verification (if configured)
-    let authnz_public_key = load_authnz_public_key();
-
     let rpc_extensions_builder = {
         let client = client.clone();
         let pool = transaction_pool.clone();
-        let authnz_key = authnz_public_key.clone();
 
         Box::new(move |_| {
             let deps = crate::rpc::FullDeps {
                 client: client.clone(),
                 pool: pool.clone(),
-                authnz_public_key: authnz_key.clone(),
             };
             crate::rpc::create_full(deps).map_err(Into::into)
         })

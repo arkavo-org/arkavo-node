@@ -22,6 +22,7 @@ cargo contract build --manifest-path access_registry/Cargo.toml
 cargo contract build --manifest-path attribute_store/Cargo.toml
 cargo contract build --manifest-path policy_engine/Cargo.toml
 cargo contract build --manifest-path payment_integration/Cargo.toml
+cargo contract build --manifest-path user_registry/Cargo.toml
 ```
 
 Contract artifacts are located in `contracts/target/ink/<contract_name>/`.
@@ -44,8 +45,9 @@ Contracts must be deployed in this order due to cross-contract dependencies:
 
 1. `access_registry` (standalone)
 2. `attribute_store` (standalone)
-3. `policy_engine` (requires access_registry and attribute_store addresses)
-4. `payment_integration` (requires access_registry address)
+3. `user_registry` (standalone - for DID-to-account linking)
+4. `policy_engine` (requires access_registry and attribute_store addresses)
+5. `payment_integration` (requires access_registry address)
 
 ### Step 1: Deploy access_registry
 
@@ -81,7 +83,23 @@ cargo contract instantiate \
 export ATTRIBUTE_STORE=0x...
 ```
 
-### Step 3: Deploy and Configure policy_engine
+### Step 3: Deploy user_registry
+
+```bash
+cargo contract instantiate \
+  --url $URL \
+  --suri //Alice \
+  --constructor new \
+  --skip-confirm \
+  --execute \
+  contracts/target/ink/user_registry/user_registry.contract
+```
+
+```bash
+export USER_REGISTRY=0x...
+```
+
+### Step 4: Deploy and Configure policy_engine
 
 ```bash
 cargo contract instantiate \
@@ -123,7 +141,7 @@ cargo contract call \
   contracts/target/ink/policy_engine/policy_engine.contract
 ```
 
-### Step 4: Deploy and Configure payment_integration
+### Step 5: Deploy and Configure payment_integration
 
 ```bash
 cargo contract instantiate \
@@ -190,6 +208,30 @@ cargo contract call \
   contracts/target/ink/attribute_store/attribute_store.contract
 ```
 
+### Get Account by DID (user_registry)
+
+```bash
+cargo contract call \
+  --url $URL \
+  --contract $USER_REGISTRY \
+  --message get_account_by_did \
+  --args "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK" \
+  --suri //Alice \
+  contracts/target/ink/user_registry/user_registry.contract
+```
+
+### Check if Account is Linked (user_registry)
+
+```bash
+cargo contract call \
+  --url $URL \
+  --contract $USER_REGISTRY \
+  --message is_linked \
+  --args "0x0101010101010101010101010101010101010101" \
+  --suri //Alice \
+  contracts/target/ink/user_registry/user_registry.contract
+```
+
 ## Execute State Changes
 
 ### Grant Entitlement (Owner Only)
@@ -234,6 +276,59 @@ cargo contract call \
   contracts/target/ink/access_registry/access_registry.contract
 ```
 
+### Link Account to DID (user_registry - self-linking)
+
+This is a one-time, permanent operation. Once linked, the binding cannot be changed.
+
+```bash
+cargo contract call \
+  --url $URL \
+  --contract $USER_REGISTRY \
+  --message link_account \
+  --args "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK" \
+  --suri //Bob \
+  --skip-confirm \
+  --execute \
+  contracts/target/ink/user_registry/user_registry.contract
+```
+
+Note: The caller's address (derived from --suri) will be permanently linked to the DID.
+
+### Link Account for User (user_registry - owner-only, for RPC backchannel)
+
+The contract owner can link a DID to any address on behalf of users:
+
+```bash
+cargo contract call \
+  --url $URL \
+  --contract $USER_REGISTRY \
+  --message link_account_for \
+  --args "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK" "0x0202020202020202020202020202020202020202" \
+  --suri //Alice \
+  --skip-confirm \
+  --execute \
+  contracts/target/ink/user_registry/user_registry.contract
+```
+
+Note: Only the contract owner (deployer) can call this method.
+
+## RPC Integration
+
+After deploying the `user_registry` contract, configure the node to use it for the `arkavo_linkAccountWithProof` RPC endpoint:
+
+```bash
+# Set the deployed user_registry contract address (H160 format)
+export USER_REGISTRY_ADDRESS=0x...
+
+# Set the contract owner account (SS58 format, must match the deployer)
+export USER_REGISTRY_OWNER=5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
+
+# Start the node
+./target/debug/arkavo-node --dev
+```
+
+The RPC endpoint `arkavo_linkAccountWithProof` is called by authnz-rs after successful WebAuthn registration to link DIDs to blockchain addresses on-chain.
+
 ## Development Accounts
 
 The following development accounts are pre-funded on the dev chain:
@@ -253,6 +348,7 @@ The following development accounts are pre-funded on the dev chain:
 |----------|----------------------|
 | access_registry | None (standalone) |
 | attribute_store | None (standalone) |
+| user_registry | None (standalone) |
 | policy_engine | `set_access_registry()`, `set_attribute_store()` |
 | payment_integration | `set_access_registry()` |
 

@@ -4,6 +4,7 @@ members = [
     "attribute_store",
     "policy_engine",
     "payment_integration",
+    "user_registry",
 ]
 resolver = "2"
 

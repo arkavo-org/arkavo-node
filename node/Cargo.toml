@@ -49,11 +49,14 @@ sp-runtime = { workspace = true, default-features = true }
 sp-timestamp = { workspace = true, default-features = true }
 substrate-frame-rpc-system = { workspace = true, default-features = true }
 
-# JWT verification for AuthnZ integration
-jsonwebtoken = { workspace = true }
+# AuthnZ integration
 serde = { workspace = true, default-features = true }
+uuid = { version = "1.18", features = ["v4"] }
 serde_json = { workspace = true, default-features = true }
 log = "0.4"
+hex = "0.4"
+pallet-revive = { workspace = true, default-features = true }
+parity-scale-codec = { package = "parity-scale-codec", version = "3.6", features = ["derive"] }
 
 [build-dependencies]
 substrate-build-script-utils = { workspace = true, default-features = true }

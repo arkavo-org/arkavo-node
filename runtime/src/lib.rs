@@ -11,9 +11,8 @@ pub mod configs;
 extern crate alloc;
 use alloc::vec::Vec;
 use sp_runtime::{
-    generic, impl_opaque_keys,
+    MultiAddress, MultiSignature, generic, impl_opaque_keys,
     traits::{BlakeTwo256, IdentifyAccount, Verify},
-    MultiAddress, MultiSignature,
 };
 #[cfg(feature = "std")]
 use sp_version::NativeVersion;
