@@ -38,6 +38,8 @@ mod auth_api {
         pub user_id: Option<String>,
         /// Error message (if failed)
         pub error: Option<String>,
+        /// Error code for programmatic handling (e.g., "DID_ALREADY_LINKED")
+        pub error_code: Option<String>,
     }
 
     /// Configuration for user registry contract
@@ -150,6 +152,7 @@ mod auth_api {
                     address: None,
                     user_id: None,
                     error: Some("Invalid user_id: must be a valid UUID".to_string()),
+                    error_code: Some("INVALID_UUID".to_string()),
                 });
             }
 
@@ -163,6 +166,7 @@ mod auth_api {
                         address: None,
                         user_id: None,
                         error: Some(e),
+                        error_code: Some("INVALID_ADDRESS".to_string()),
                     });
                 }
             };
@@ -175,6 +179,7 @@ mod auth_api {
                     address: None,
                     user_id: None,
                     error: Some("Invalid DID format: must start with 'did:key:'".to_string()),
+                    error_code: Some("INVALID_DID_FORMAT".to_string()),
                 });
             }
 
@@ -195,6 +200,7 @@ mod auth_api {
                     error: Some(
                         "User registry contract not configured. Set USER_REGISTRY_ADDRESS and USER_REGISTRY_OWNER environment variables.".to_string()
                     ),
+                    error_code: Some("CONTRACT_NOT_CONFIGURED".to_string()),
                 });
             };
 
@@ -234,23 +240,25 @@ mod auth_api {
                                     address: Some(address),
                                     user_id: Some(user_id),
                                     error: None,
+                                    error_code: None,
                                 })
                             } else {
                                 // Contract returned an error
-                                let error_msg = decode_contract_error(&exec_result.data);
+                                let contract_error = decode_contract_error(&exec_result.data);
                                 log::error!(
                                     "Contract call failed: user_id={}, did={}, address={}, error={}",
                                     user_id,
                                     did,
                                     address,
-                                    error_msg
+                                    contract_error.message
                                 );
                                 Ok(LinkAccountResult {
                                     success: false,
                                     did: Some(did),
                                     address: Some(address),
                                     user_id: Some(user_id),
-                                    error: Some(error_msg),
+                                    error: Some(contract_error.message),
+                                    error_code: Some(contract_error.code),
                                 })
                             }
                         }
@@ -268,6 +276,7 @@ mod auth_api {
                                 address: Some(address),
                                 user_id: Some(user_id),
                                 error: Some(format!("Contract execution failed: {:?}", error)),
+                                error_code: Some("CONTRACT_EXECUTION_FAILED".to_string()),
                             })
                         }
                     }
@@ -286,28 +295,60 @@ mod auth_api {
                         address: Some(address),
                         user_id: Some(user_id),
                         error: Some(format!("Runtime API error: {}", e)),
+                        error_code: Some("RUNTIME_ERROR".to_string()),
                     })
                 }
             }
         }
     }
 
+    /// Decoded contract error with both human-readable message and machine-readable code
+    struct ContractError {
+        message: String,
+        code: String,
+    }
+
     /// Decode contract error from return data
     /// The user_registry contract returns SCALE-encoded Error enum
-    fn decode_contract_error(data: &[u8]) -> String {
+    fn decode_contract_error(data: &[u8]) -> ContractError {
         // Try to decode as our Error enum variant index
         if data.is_empty() {
-            return "Unknown contract error (empty data)".to_string();
+            return ContractError {
+                message: "Unknown contract error (empty data)".to_string(),
+                code: "CONTRACT_ERROR".to_string(),
+            };
         }
 
         // The first byte is the enum variant index
         match data[0] {
-            0 => "DID is already linked to another account".to_string(),
-            1 => "Account is already linked to a DID".to_string(),
-            2 => "Invalid DID format".to_string(),
-            3 => "Empty DID".to_string(),
-            4 => "Not the contract owner".to_string(),
-            _ => format!("Unknown contract error (code: {})", data[0]),
+            0 => ContractError {
+                message: "DID is already linked to another account".to_string(),
+                code: "DID_ALREADY_LINKED".to_string(),
+            },
+            1 => ContractError {
+                message: "Account is already linked to a DID".to_string(),
+                code: "ACCOUNT_ALREADY_LINKED".to_string(),
+            },
+            2 => ContractError {
+                message: "Invalid DID format".to_string(),
+                code: "INVALID_DID_FORMAT".to_string(),
+            },
+            3 => ContractError {
+                message: "Empty DID".to_string(),
+                code: "EMPTY_DID".to_string(),
+            },
+            4 => ContractError {
+                message: "Not the contract owner".to_string(),
+                code: "NOT_OWNER".to_string(),
+            },
+            5 => ContractError {
+                message: "DID exceeds maximum length".to_string(),
+                code: "DID_TOO_LONG".to_string(),
+            },
+            _ => ContractError {
+                message: format!("Unknown contract error (code: {})", data[0]),
+                code: "CONTRACT_ERROR".to_string(),
+            },
         }
     }
 
@@ -350,6 +391,7 @@ mod auth_api {
     }
 
     #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
     mod tests {
         use super::*;
 
@@ -435,30 +477,44 @@ mod auth_api {
 
         #[test]
         fn decode_contract_error_all_variants() {
-            assert_eq!(
-                decode_contract_error(&[0]),
-                "DID is already linked to another account"
-            );
-            assert_eq!(
-                decode_contract_error(&[1]),
-                "Account is already linked to a DID"
-            );
-            assert_eq!(decode_contract_error(&[2]), "Invalid DID format");
-            assert_eq!(decode_contract_error(&[3]), "Empty DID");
-            assert_eq!(decode_contract_error(&[4]), "Not the contract owner");
+            let err0 = decode_contract_error(&[0]);
+            assert_eq!(err0.message, "DID is already linked to another account");
+            assert_eq!(err0.code, "DID_ALREADY_LINKED");
+
+            let err1 = decode_contract_error(&[1]);
+            assert_eq!(err1.message, "Account is already linked to a DID");
+            assert_eq!(err1.code, "ACCOUNT_ALREADY_LINKED");
+
+            let err2 = decode_contract_error(&[2]);
+            assert_eq!(err2.message, "Invalid DID format");
+            assert_eq!(err2.code, "INVALID_DID_FORMAT");
+
+            let err3 = decode_contract_error(&[3]);
+            assert_eq!(err3.message, "Empty DID");
+            assert_eq!(err3.code, "EMPTY_DID");
+
+            let err4 = decode_contract_error(&[4]);
+            assert_eq!(err4.message, "Not the contract owner");
+            assert_eq!(err4.code, "NOT_OWNER");
+
+            let err5 = decode_contract_error(&[5]);
+            assert_eq!(err5.message, "DID exceeds maximum length");
+            assert_eq!(err5.code, "DID_TOO_LONG");
         }
 
         #[test]
         fn decode_contract_error_unknown_variant() {
             let result = decode_contract_error(&[99]);
-            assert!(result.contains("Unknown contract error"));
-            assert!(result.contains("99"));
+            assert!(result.message.contains("Unknown contract error"));
+            assert!(result.message.contains("99"));
+            assert_eq!(result.code, "CONTRACT_ERROR");
         }
 
         #[test]
         fn decode_contract_error_empty_data() {
             let result = decode_contract_error(&[]);
-            assert_eq!(result, "Unknown contract error (empty data)");
+            assert_eq!(result.message, "Unknown contract error (empty data)");
+            assert_eq!(result.code, "CONTRACT_ERROR");
         }
     }
 }

@@ -36,6 +36,9 @@ mod user_registry {
         by_owner: bool,
     }
 
+    /// Maximum length for a DID (prevents DoS via excessive storage)
+    const MAX_DID_LENGTH: usize = 256;
+
     /// Errors that can occur during contract execution
     #[derive(Debug, PartialEq, Eq, Clone, scale::Encode, scale::Decode)]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
@@ -50,6 +53,23 @@ mod user_registry {
         EmptyDid,
         /// Only the contract owner can perform this action
         NotOwner,
+        /// DID exceeds maximum length
+        DidTooLong,
+    }
+
+    impl core::fmt::Display for Error {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                Error::DidAlreadyLinked => write!(f, "DID is already linked to another account"),
+                Error::AccountAlreadyLinked => write!(f, "Account is already linked to a DID"),
+                Error::InvalidDidFormat => {
+                    write!(f, "Invalid DID format (must start with 'did:key:')")
+                }
+                Error::EmptyDid => write!(f, "DID cannot be empty"),
+                Error::NotOwner => write!(f, "Only the contract owner can perform this action"),
+                Error::DidTooLong => write!(f, "DID exceeds maximum length of 256 bytes"),
+            }
+        }
     }
 
     pub type Result<T> = core::result::Result<T, Error>;
@@ -72,10 +92,13 @@ mod user_registry {
             }
         }
 
-        /// Validate DID format
+        /// Validate DID format and length
         fn validate_did(&self, did: &str) -> Result<()> {
             if did.is_empty() {
                 return Err(Error::EmptyDid);
+            }
+            if did.len() > MAX_DID_LENGTH {
+                return Err(Error::DidTooLong);
             }
             if !did.starts_with("did:key:") {
                 return Err(Error::InvalidDidFormat);
@@ -284,6 +307,17 @@ mod user_registry {
                 contract.link_account(String::from("did:web:example.com")),
                 Err(Error::InvalidDidFormat)
             );
+        }
+
+        #[ink::test]
+        fn link_account_rejects_did_too_long() {
+            let mut contract = UserRegistry::new();
+
+            // Create a DID that exceeds MAX_DID_LENGTH (256 bytes)
+            let long_suffix = "a".repeat(300);
+            let long_did = ink::prelude::format!("did:key:{}", long_suffix);
+
+            assert_eq!(contract.link_account(long_did), Err(Error::DidTooLong));
         }
 
         #[ink::test]
