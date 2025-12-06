@@ -348,6 +348,119 @@ mod auth_api {
             owner_account,
         })
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn encode_link_account_for_produces_correct_selector() {
+            let did = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+            let address = H160::from([0x12; 20]);
+
+            let encoded = encode_link_account_for(did, address);
+
+            // Selector for "link_account_for" is 0x032efef7 (verified against contract metadata)
+            assert_eq!(&encoded[0..4], &[0x03, 0x2e, 0xfe, 0xf7]);
+        }
+
+        #[test]
+        fn encode_link_account_for_includes_scale_encoded_args() {
+            let did = "did:key:test";
+            let address = H160::from([0xAB; 20]);
+
+            let encoded = encode_link_account_for(did, address);
+
+            // After 4-byte selector, should have SCALE-encoded string (length-prefixed)
+            // "did:key:test" is 12 bytes, SCALE compact encoding for 12 is 0x30 (12 << 2)
+            assert_eq!(encoded[4], 0x30); // Compact length prefix for 12 bytes
+
+            // String content follows
+            assert_eq!(&encoded[5..17], b"did:key:test");
+
+            // Then 20-byte address
+            assert_eq!(&encoded[17..37], &[0xAB; 20]);
+        }
+
+        #[test]
+        fn parse_h160_valid_address() {
+            let addr_str = "0x1234567890abcdef1234567890abcdef12345678";
+            let result = parse_h160(addr_str);
+
+            assert!(result.is_ok());
+            let h160 = result.unwrap();
+            assert_eq!(
+                h160.as_bytes(),
+                &[
+                    0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90,
+                    0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78
+                ]
+            );
+        }
+
+        #[test]
+        fn parse_h160_rejects_missing_prefix() {
+            let addr_str = "1234567890abcdef1234567890abcdef12345678";
+            let result = parse_h160(addr_str);
+
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("0x-prefixed"));
+        }
+
+        #[test]
+        fn parse_h160_rejects_invalid_length_short() {
+            let addr_str = "0x1234";
+            let result = parse_h160(addr_str);
+
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("0x-prefixed 20-byte"));
+        }
+
+        #[test]
+        fn parse_h160_rejects_invalid_length_long() {
+            let addr_str = "0x1234567890abcdef1234567890abcdef1234567890";
+            let result = parse_h160(addr_str);
+
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn parse_h160_rejects_invalid_hex() {
+            let addr_str = "0xGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG";
+            let result = parse_h160(addr_str);
+
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("Invalid hex"));
+        }
+
+        #[test]
+        fn decode_contract_error_all_variants() {
+            assert_eq!(
+                decode_contract_error(&[0]),
+                "DID is already linked to another account"
+            );
+            assert_eq!(
+                decode_contract_error(&[1]),
+                "Account is already linked to a DID"
+            );
+            assert_eq!(decode_contract_error(&[2]), "Invalid DID format");
+            assert_eq!(decode_contract_error(&[3]), "Empty DID");
+            assert_eq!(decode_contract_error(&[4]), "Not the contract owner");
+        }
+
+        #[test]
+        fn decode_contract_error_unknown_variant() {
+            let result = decode_contract_error(&[99]);
+            assert!(result.contains("Unknown contract error"));
+            assert!(result.contains("99"));
+        }
+
+        #[test]
+        fn decode_contract_error_empty_data() {
+            let result = decode_contract_error(&[]);
+            assert_eq!(result, "Unknown contract error (empty data)");
+        }
+    }
 }
 
 /// Full client dependencies.
