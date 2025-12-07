@@ -9,6 +9,7 @@ mod cli;
 mod command;
 mod rpc;
 mod service;
+mod tls_rpc;
 
 fn main() -> sc_cli::Result<()> {
     command::run().map_err(|e| *e)

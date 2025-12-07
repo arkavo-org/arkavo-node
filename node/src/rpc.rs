@@ -527,7 +527,7 @@ pub struct FullDeps<C, P> {
     pub pool: Arc<P>,
 }
 
-/// Instantiate all full RPC extensions.
+/// Instantiate all full RPC extensions (includes unsafe auth_api methods).
 pub fn create_full<C, P>(
     deps: FullDeps<C, P>,
 ) -> Result<RpcModule<()>, Box<dyn std::error::Error + Send + Sync>>

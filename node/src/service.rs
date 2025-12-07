@@ -12,6 +12,9 @@ use sp_consensus_aura::sr25519::AuthorityPair as AuraPair;
 
 use std::{sync::Arc, time::Duration};
 
+use crate::cli::TlsConfig;
+use crate::tls_rpc::{TlsRpcConfig, start_tls_rpc_server};
+
 pub(crate) type FullClient = sc_service::TFullClient<
     Block,
     RuntimeApi,
@@ -141,6 +144,7 @@ pub fn new_full<
     N: sc_network::NetworkBackend<Block, <Block as sp_runtime::traits::Block>::Hash>,
 >(
     config: Configuration,
+    tls_config: Option<TlsConfig>,
 ) -> Result<TaskManager, Box<ServiceError>> {
     let sc_service::PartialComponents {
         client,
@@ -242,7 +246,7 @@ pub fn new_full<
         })
     };
 
-    let _rpc_handlers = sc_service::spawn_tasks(sc_service::SpawnTasksParams {
+    let rpc_handlers = sc_service::spawn_tasks(sc_service::SpawnTasksParams {
         network: Arc::new(network.clone()),
         client: client.clone(),
         keystore: keystore_container.keystore(),
@@ -257,6 +261,53 @@ pub fn new_full<
         telemetry: telemetry.as_mut(),
     })
     .map_err(Box::new)?;
+
+    // Start TLS RPC server if configured
+    if let Some(tls_cfg) = tls_config {
+        // Get the full RPC module from spawn_tasks (includes chain_*, state_*, author_*, etc.)
+        let full_rpc_module = rpc_handlers.handle();
+
+        // Clone and add the rpc_methods introspection method (normally added by Substrate's RPC server)
+        let mut rpc_module = (*full_rpc_module).clone();
+        let mut method_names: Vec<_> = rpc_module.method_names().map(String::from).collect();
+        method_names.push("rpc_methods".to_string());
+        method_names.sort();
+
+        rpc_module
+            .register_method("rpc_methods", move |_, _, _| {
+                Ok::<_, jsonrpsee::types::ErrorObjectOwned>(
+                    serde_json::json!({ "methods": method_names }),
+                )
+            })
+            .expect("rpc_methods registration should not fail");
+
+        log::info!(
+            "TLS RPC server with {} methods",
+            rpc_module.method_names().count()
+        );
+
+        // Convert RpcModule to Methods for the TLS server
+        let methods: jsonrpsee::Methods = rpc_module.into();
+
+        let tls_rpc_config = TlsRpcConfig {
+            cert_path: tls_cfg.cert_path,
+            key_path: tls_cfg.key_path,
+            port: tls_cfg.port,
+            bind_addr: tls_cfg.bind_addr,
+        };
+
+        // Spawn the TLS server as a background task
+        task_manager.spawn_handle().spawn(
+            "tls-rpc-server",
+            Some("rpc"),
+            async move {
+                if let Err(e) = start_tls_rpc_server(tls_rpc_config, methods).await {
+                    log::error!("TLS RPC server error: {e}");
+                }
+            }
+            .boxed(),
+        );
+    }
 
     if role.is_authority() {
         let proposer_factory = sc_basic_authorship::ProposerFactory::new(

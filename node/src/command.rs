@@ -225,6 +225,7 @@ pub fn run() -> Result<(), Box<CliError>> {
         }
         None => {
             let runner = cli.create_runner(&cli.run)?;
+            let tls_config = cli.tls_config();
             runner
                 .run_node_until_exit(|config| async move {
                     match config.network.network_backend {
@@ -234,12 +235,14 @@ pub fn run() -> Result<(), Box<CliError>> {
                                 <arkavo_runtime::opaque::Block as sp_runtime::traits::Block>::Hash,
                             >,
                         >(
-                            config
+                            config, tls_config
                         )
                         .map_err(|e| CliError::Service(*e)),
                         sc_network::config::NetworkBackendType::Litep2p => {
-                            service::new_full::<sc_network::Litep2pNetworkBackend>(config)
-                                .map_err(|e| CliError::Service(*e))
+                            service::new_full::<sc_network::Litep2pNetworkBackend>(
+                                config, tls_config,
+                            )
+                            .map_err(|e| CliError::Service(*e))
                         }
                     }
                 })
