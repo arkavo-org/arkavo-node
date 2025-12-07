@@ -1,12 +1,12 @@
 //! TLS-enabled RPC server for secure WebSocket connections (wss://)
 
-use std::{fs::File, io::BufReader, net::SocketAddr, path::Path, sync::Arc};
+use std::{net::SocketAddr, path::Path, sync::Arc};
 
 use jsonrpsee::{
     Methods,
     server::{serve_with_graceful_shutdown, stop_channel},
 };
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use sc_rpc_api::DenyUnsafe;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -50,44 +50,18 @@ pub struct TlsRpcConfig {
     pub bind_addr: String,
 }
 
-/// Load certificates from a PEM file
+/// Load certificates from a PEM file using rustls-pki-types
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsRpcError> {
-    let file = File::open(path)
-        .map_err(|e| TlsRpcError::CertificateLoad(format!("{}: {e}", path.display())))?;
-    let mut reader = BufReader::new(file);
-
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_file_iter(path)
+        .map_err(|e| TlsRpcError::CertificateLoad(format!("{}: {e}", path.display())))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| TlsRpcError::CertificateLoad(format!("PEM parse error: {e}")))
 }
 
-/// Load private key from a PEM file
+/// Load private key from a PEM file using rustls-pki-types
 fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsRpcError> {
-    let file =
-        File::open(path).map_err(|e| TlsRpcError::KeyLoad(format!("{}: {e}", path.display())))?;
-    let mut reader = BufReader::new(file);
-
-    // Try to read any type of private key (RSA, PKCS8, EC)
-    loop {
-        match rustls_pemfile::read_one(&mut reader) {
-            Ok(Some(rustls_pemfile::Item::Pkcs1Key(key))) => {
-                return Ok(PrivateKeyDer::Pkcs1(key));
-            }
-            Ok(Some(rustls_pemfile::Item::Pkcs8Key(key))) => {
-                return Ok(PrivateKeyDer::Pkcs8(key));
-            }
-            Ok(Some(rustls_pemfile::Item::Sec1Key(key))) => {
-                return Ok(PrivateKeyDer::Sec1(key));
-            }
-            Ok(Some(_)) => continue, // Skip other items (certs, etc.)
-            Ok(None) => {
-                return Err(TlsRpcError::KeyLoad("No private key found in file".into()));
-            }
-            Err(e) => {
-                return Err(TlsRpcError::KeyLoad(format!("PEM parse error: {e}")));
-            }
-        }
-    }
+    PrivateKeyDer::from_pem_file(path)
+        .map_err(|e| TlsRpcError::KeyLoad(format!("{}: {e}", path.display())))
 }
 
 /// Create a TLS acceptor from certificate and key paths
