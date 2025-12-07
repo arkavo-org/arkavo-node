@@ -36,6 +36,7 @@ allow = [
     "0BSD",
     "Zlib",
     "MPL-2.0",
+    "OpenSSL",  # aws-lc-sys (polkadot-sdk via rustls)
 ]
 confidence-threshold = 0.8
 
