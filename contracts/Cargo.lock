@@ -9065,6 +9065,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "user_registry"
+version = "0.1.0"
+dependencies = [
+ "ink",
+ "ink_e2e",
+ "ink_sandbox",
+ "parity-scale-codec",
+ "scale-info",
+]
+
+[[package]]
 name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

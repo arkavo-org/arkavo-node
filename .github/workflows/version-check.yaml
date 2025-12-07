@@ -1,0 +1,177 @@
+name: Version Bump Check
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'node/src/**'
+      - 'node/Cargo.toml'
+      - 'runtime/src/**'
+      - 'runtime/Cargo.toml'
+      - 'contracts/**'
+
+jobs:
+  check-version-bump:
+    name: Check Version Bump
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch main branch
+        run: git fetch origin main:main
+
+      - name: Check node version bump
+        id: check-node
+        run: |
+          # Get changed files in node/src/
+          NODE_CHANGES=$(git diff --name-only main...HEAD -- 'node/src/' | wc -l)
+
+          if [ "$NODE_CHANGES" -gt 0 ]; then
+            echo "Node source files changed: $NODE_CHANGES files"
+
+            # Check if node/Cargo.toml exists on main
+            if ! git show main:node/Cargo.toml > /dev/null 2>&1; then
+              echo "Node is new in this PR, no version bump required"
+              echo "node_needs_bump=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            # Get versions
+            MAIN_VERSION=$(git show main:node/Cargo.toml | grep -m1 '^version' | sed 's/.*"\(.*\)"/\1/')
+            PR_VERSION=$(grep -m1 '^version' node/Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+
+            echo "Main branch node version: $MAIN_VERSION"
+            echo "PR branch node version: $PR_VERSION"
+
+            if [ "$MAIN_VERSION" = "$PR_VERSION" ]; then
+              echo "::error::Node source files changed but version not bumped (still $PR_VERSION). Please update node/Cargo.toml version."
+              echo "node_needs_bump=true" >> $GITHUB_OUTPUT
+            else
+              echo "Node version bumped from $MAIN_VERSION to $PR_VERSION"
+              echo "node_needs_bump=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "No node source changes detected"
+            echo "node_needs_bump=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check runtime version bump
+        id: check-runtime
+        run: |
+          # Get changed files in runtime/src/
+          RUNTIME_CHANGES=$(git diff --name-only main...HEAD -- 'runtime/src/' | wc -l)
+
+          if [ "$RUNTIME_CHANGES" -gt 0 ]; then
+            echo "Runtime source files changed: $RUNTIME_CHANGES files"
+
+            # Check if runtime/Cargo.toml exists on main
+            if ! git show main:runtime/Cargo.toml > /dev/null 2>&1; then
+              echo "Runtime is new in this PR, no version bump required"
+              echo "runtime_needs_bump=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            # Get versions
+            MAIN_VERSION=$(git show main:runtime/Cargo.toml | grep -m1 '^version' | sed 's/.*"\(.*\)"/\1/')
+            PR_VERSION=$(grep -m1 '^version' runtime/Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+
+            echo "Main branch runtime version: $MAIN_VERSION"
+            echo "PR branch runtime version: $PR_VERSION"
+
+            if [ "$MAIN_VERSION" = "$PR_VERSION" ]; then
+              echo "::error::Runtime source files changed but version not bumped (still $PR_VERSION). Please update runtime/Cargo.toml version."
+              echo "runtime_needs_bump=true" >> $GITHUB_OUTPUT
+            else
+              echo "Runtime version bumped from $MAIN_VERSION to $PR_VERSION"
+              echo "runtime_needs_bump=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "No runtime source changes detected"
+            echo "runtime_needs_bump=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check contract version bumps
+        id: check-contracts
+        run: |
+          CONTRACTS_NEED_BUMP=""
+
+          for CONTRACT in access_registry attribute_store policy_engine payment_integration user_registry; do
+            CONTRACT_DIR="contracts/$CONTRACT"
+
+            if [ ! -d "$CONTRACT_DIR" ]; then
+              continue
+            fi
+
+            # Get changed files in contract
+            CONTRACT_CHANGES=$(git diff --name-only main...HEAD -- "$CONTRACT_DIR/lib.rs" "$CONTRACT_DIR/src/" 2>/dev/null | wc -l)
+
+            if [ "$CONTRACT_CHANGES" -gt 0 ]; then
+              echo "$CONTRACT source files changed: $CONTRACT_CHANGES files"
+
+              # Check if Cargo.toml exists on main
+              if git show main:$CONTRACT_DIR/Cargo.toml > /dev/null 2>&1; then
+                MAIN_VERSION=$(git show main:$CONTRACT_DIR/Cargo.toml | grep -m1 '^version' | sed 's/.*"\(.*\)"/\1/')
+              else
+                MAIN_VERSION="0.0.0"
+              fi
+
+              PR_VERSION=$(grep -m1 '^version' $CONTRACT_DIR/Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+
+              echo "  Main: $MAIN_VERSION, PR: $PR_VERSION"
+
+              if [ "$MAIN_VERSION" = "$PR_VERSION" ]; then
+                echo "::warning::Contract $CONTRACT source changed but version not bumped (still $PR_VERSION)"
+                CONTRACTS_NEED_BUMP="$CONTRACTS_NEED_BUMP $CONTRACT"
+              fi
+            fi
+          done
+
+          if [ -n "$CONTRACTS_NEED_BUMP" ]; then
+            echo "contracts_need_bump=true" >> $GITHUB_OUTPUT
+            echo "contracts_list=$CONTRACTS_NEED_BUMP" >> $GITHUB_OUTPUT
+          else
+            echo "contracts_need_bump=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fail if version bumps required
+        if: steps.check-node.outputs.node_needs_bump == 'true' || steps.check-runtime.outputs.runtime_needs_bump == 'true'
+        run: |
+          echo "Version bump(s) required:"
+          if [ "${{ steps.check-node.outputs.node_needs_bump }}" = "true" ]; then
+            echo "  - node/Cargo.toml"
+          fi
+          if [ "${{ steps.check-runtime.outputs.runtime_needs_bump }}" = "true" ]; then
+            echo "  - runtime/Cargo.toml"
+          fi
+          echo ""
+          echo "Please bump the version(s) using semantic versioning:"
+          echo "  - PATCH (0.1.0 -> 0.1.1): Bug fixes, minor changes"
+          echo "  - MINOR (0.1.0 -> 0.2.0): New features, backward compatible"
+          echo "  - MAJOR (0.1.0 -> 1.0.0): Breaking changes"
+          exit 1
+
+      - name: Summary
+        run: |
+          echo "## Version Check Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.check-node.outputs.node_needs_bump }}" = "true" ]; then
+            echo "- :x: **Node**: Version bump required" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- :white_check_mark: **Node**: OK" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ steps.check-runtime.outputs.runtime_needs_bump }}" = "true" ]; then
+            echo "- :x: **Runtime**: Version bump required" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- :white_check_mark: **Runtime**: OK" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ steps.check-contracts.outputs.contracts_need_bump }}" = "true" ]; then
+            echo "- :warning: **Contracts**: Consider bumping: ${{ steps.check-contracts.outputs.contracts_list }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- :white_check_mark: **Contracts**: OK" >> $GITHUB_STEP_SUMMARY
+          fi

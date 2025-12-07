@@ -13,7 +13,7 @@ exclude = ["contracts", "tools/*"]
 
 [workspace.package]
 authors = ["Arkavo Team"]
-edition = "2021"
+edition = "2024"
 repository = "https://github.com/arkavo-org/arkavo-node"
 license = "GPL-3.0-or-later"
 
