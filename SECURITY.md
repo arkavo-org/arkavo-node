@@ -4,9 +4,9 @@
 
 This document tracks known security vulnerabilities in Arkavo Node's dependency chain. Many of these vulnerabilities are inherited from upstream Substrate/Polkadot SDK and Ink! dependencies and are being tracked for resolution.
 
-**Last Audit**: 2025-11-24
+**Last Audit**: 2026-02-01
 **Total Dependencies**: 881 crates
-**Vulnerabilities**: 1 active CVE, 4 unmaintained advisories, 1 yanked
+**Vulnerabilities**: 2 active CVEs, 4 unmaintained advisories, 1 yanked
 
 ### Vulnerability Tracking Approach
 
@@ -31,6 +31,17 @@ We take a **transparent, deny-by-default** approach to dependency security using
 - Upstream issues tracked and documented, not hidden
 
 ### Current Known CVEs
+
+#### RUSTSEC-2026-0006: wasmtime 35.0.0 🔴 CRITICAL
+- **Severity**: High
+- **Status**: Upstream dependency (Substrate WASM executor)
+- **Description**: Wasmtime segfault or unused out-of-sandbox load with `f64.copysign` operator on x86-64. See [GHSA-vc8c-j3xm-xj73](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-vc8c-j3xm-xj73)
+- **Impact**: Potential memory safety issues in WASM execution on x86-64 platforms
+- **Dependency Path**: `sc-executor` → `sc-executor-wasmtime` → `wasmtime 35.0.0`
+- **Mitigation**: Awaiting Substrate update to wasmtime >=36.0.5. Tracking Polkadot SDK stable2509 branch.
+- **Solution**: Upgrade to wasmtime >=41.0.1 OR >=40.0.3, <41.0.0 OR >=36.0.5, <37.0.0
+- **Tracking**: https://rustsec.org/advisories/RUSTSEC-2026-0006.html
+- **Note**: This is a **blocking issue** - awaiting upstream Substrate fix before removing from ignore list
 
 #### RUSTSEC-2025-0118: wasmtime 35.0.0 🔴 CRITICAL
 - **Severity**: High
@@ -152,5 +163,5 @@ See [CLAUDE.md](CLAUDE.md) for detailed security tooling documentation.
 
 ---
 
-**Last Updated**: 2025-11-23
-**Next Review**: 2025-12-23
+**Last Updated**: 2026-02-01
+**Next Review**: 2026-03-01
