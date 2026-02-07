@@ -4,7 +4,7 @@
 
 This document tracks known security vulnerabilities in Arkavo Node's dependency chain. Many of these vulnerabilities are inherited from upstream Substrate/Polkadot SDK and Ink! dependencies and are being tracked for resolution.
 
-**Last Audit**: 2026-02-01
+**Last Audit**: 2026-02-07
 **Total Dependencies**: 881 crates
 **Vulnerabilities**: 2 active CVEs, 4 unmaintained advisories, 1 yanked
 
@@ -111,6 +111,18 @@ The following dependencies are flagged as unmaintained in our dependency tree:
 - **Why this works**: Runtime package doesn't have the sc-service → pallet-staking dependency chain, so the compilation error doesn't occur
 - **Tracking**: Substrate stable2509 branch commit fd902fcc - awaiting upstream fix. Once fixed, restore clippy to check all packages.
 
+### Resolved Advisories
+
+#### RUSTSEC-2026-0007: bytes 1.11.0 (Resolved 2026-02-07)
+- **Severity**: High
+- **Description**: Memory safety issue in `BytesMut::reserve` - unchecked integer overflow in release builds could lead to out-of-bounds memory access
+- **Resolution**: Updated `bytes` from 1.11.0 to 1.11.1 via `cargo update -p bytes`
+
+#### RUSTSEC-2026-0009: time 0.3.46 (Resolved 2026-02-07)
+- **Severity**: Medium
+- **Description**: Stack exhaustion DoS via RFC 2822 format parsing with malicious input
+- **Resolution**: Updated `time` from 0.3.46 to 0.3.47 via `cargo update -p time`
+
 ### Dependency Management Strategy
 
 Arkavo Node inherits ~500+ transitive dependencies from the Substrate/Polkadot SDK. Our security strategy includes:
@@ -163,5 +175,5 @@ See [CLAUDE.md](CLAUDE.md) for detailed security tooling documentation.
 
 ---
 
-**Last Updated**: 2026-02-01
+**Last Updated**: 2026-02-07
 **Next Review**: 2026-03-01
