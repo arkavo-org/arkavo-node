@@ -18,6 +18,59 @@ mod access_registry {
         Vip,
     }
 
+    /// Status of a read request.
+    #[derive(Default, Debug, PartialEq, Eq, Clone, Copy, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub enum RequestStatus {
+        #[default]
+        Pending,
+        Approved,
+        Denied,
+    }
+
+    /// A read request submitted by a user wanting access to a letter.
+    #[derive(Default, Debug, PartialEq, Eq, Clone, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub struct ReadRequestRecord {
+        /// Hash of the letter being requested
+        pub letter_id: [u8; 32],
+        /// Hash of the requester's email (privacy-preserving)
+        pub email_hash: [u8; 32],
+        /// Account that submitted the request
+        pub requester: Address,
+        /// Current status of the request
+        pub status: RequestStatus,
+        /// Block when the request was submitted
+        pub submitted_at_block: u64,
+        /// Block when the request was resolved (approved/denied), 0 if pending
+        pub resolved_at_block: u64,
+        /// Admin who resolved the request (zero address if pending)
+        pub resolved_by: Address,
+    }
+
+    /// A dissem list entry granting read access to a letter.
+    #[derive(Default, Debug, PartialEq, Eq, Clone, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub struct DissemEntry {
+        /// Block when the entitlement was granted
+        pub granted_at_block: u64,
+        /// Block when the entitlement expires (0 = no expiry)
+        pub expires_at_block: u64,
+        /// Whether this entry has been revoked
+        pub is_revoked: bool,
+        /// Admin who granted this entry
+        pub granted_by: Address,
+    }
+
     /// Session grant for chain-driven access control.
     ///
     /// Represents an access session issued by the blockchain. Agents must
@@ -88,6 +141,12 @@ mod access_registry {
         attribute_store: Option<Address>,
         /// Scope requirements: `scope_id` -> required attribute hashes
         scope_requirements: Mapping<[u8; 32], ScopeRequirement>,
+        /// Admin accounts that can approve/deny read requests
+        admins: Mapping<Address, bool>,
+        /// Read requests: `request_id` -> `ReadRequestRecord`
+        read_requests: Mapping<[u8; 32], ReadRequestRecord>,
+        /// Dissem list: `dissem_key(letter_id, email_hash)` -> `DissemEntry`
+        dissem_entries: Mapping<[u8; 32], DissemEntry>,
     }
 
     /// Events emitted by the contract
@@ -133,6 +192,53 @@ mod access_registry {
         scope_id: [u8; 32],
     }
 
+    #[ink(event)]
+    pub struct AdminAdded {
+        #[ink(topic)]
+        admin: Address,
+    }
+
+    #[ink(event)]
+    pub struct AdminRemoved {
+        #[ink(topic)]
+        admin: Address,
+    }
+
+    #[ink(event)]
+    pub struct ReadRequestSubmitted {
+        #[ink(topic)]
+        request_id: [u8; 32],
+        #[ink(topic)]
+        requester: Address,
+        letter_id: [u8; 32],
+        email_hash: [u8; 32],
+    }
+
+    #[ink(event)]
+    pub struct ReadRequestApproved {
+        #[ink(topic)]
+        request_id: [u8; 32],
+        #[ink(topic)]
+        admin: Address,
+        letter_id: [u8; 32],
+        email_hash: [u8; 32],
+    }
+
+    #[ink(event)]
+    pub struct ReadRequestDenied {
+        #[ink(topic)]
+        request_id: [u8; 32],
+        #[ink(topic)]
+        admin: Address,
+    }
+
+    #[ink(event)]
+    pub struct DissemEntryRevoked {
+        #[ink(topic)]
+        letter_id: [u8; 32],
+        email_hash: [u8; 32],
+    }
+
     /// Errors that can occur during contract execution
     #[derive(Debug, PartialEq, Eq, Clone, scale::Encode, scale::Decode)]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
@@ -155,6 +261,16 @@ mod access_registry {
         ScopeNotFound,
         /// Scope is inactive
         ScopeInactive,
+        /// Caller is not an admin
+        NotAdmin,
+        /// Read request not found
+        RequestNotFound,
+        /// Read request has already been processed
+        RequestAlreadyProcessed,
+        /// A request for this letter+email already exists
+        DuplicateRequest,
+        /// Dissem entry not found
+        DissemEntryNotFound,
     }
 
     pub type Result<T> = core::result::Result<T, Error>;
@@ -166,15 +282,23 @@ mod access_registry {
     }
 
     impl AccessRegistry {
-        /// Constructor that initializes the contract
+        /// Constructor that initializes the contract.
+        /// The deployer becomes the owner and is automatically an admin.
         #[ink(constructor)]
         pub fn new() -> Self {
+            let owner = Self::env().caller();
+            let mut admins = Mapping::default();
+            admins.insert(owner, &true);
+
             Self {
                 entitlements: Mapping::default(),
                 sessions: Mapping::default(),
-                owner: Self::env().caller(),
+                owner,
                 attribute_store: None,
                 scope_requirements: Mapping::default(),
+                admins,
+                read_requests: Mapping::default(),
+                dissem_entries: Mapping::default(),
             }
         }
 
@@ -227,6 +351,298 @@ mod access_registry {
         #[ink(message)]
         pub fn owner(&self) -> Address {
             self.owner
+        }
+
+        // ──────────────────────────────────────────────────
+        // Admin Management
+        // ──────────────────────────────────────────────────
+
+        /// Add an admin account. Only the owner can add admins.
+        #[ink(message)]
+        pub fn add_admin(&mut self, account: Address) -> Result<()> {
+            if self.env().caller() != self.owner {
+                return Err(Error::NotOwner);
+            }
+            self.admins.insert(account, &true);
+            self.env().emit_event(AdminAdded { admin: account });
+            Ok(())
+        }
+
+        /// Remove an admin account. Only the owner can remove admins.
+        #[ink(message)]
+        pub fn remove_admin(&mut self, account: Address) -> Result<()> {
+            if self.env().caller() != self.owner {
+                return Err(Error::NotOwner);
+            }
+            self.admins.remove(account);
+            self.env().emit_event(AdminRemoved { admin: account });
+            Ok(())
+        }
+
+        /// Check if an account is an admin.
+        #[ink(message)]
+        pub fn is_admin_account(&self, account: Address) -> bool {
+            self.admins.get(account).unwrap_or(false)
+        }
+
+        /// Check if caller is owner or admin.
+        fn caller_is_admin(&self) -> bool {
+            let caller = self.env().caller();
+            caller == self.owner || self.admins.get(caller).unwrap_or(false)
+        }
+
+        // ──────────────────────────────────────────────────
+        // Read Request Workflow
+        // ──────────────────────────────────────────────────
+
+        /// Submit a read request for a letter.
+        ///
+        /// Anyone can submit a request. The `letter_id` and `email_hash` are
+        /// 32-byte hashes to preserve privacy on-chain. The request ID is
+        /// deterministic: `H(letter_id || email_hash)`, preventing duplicates.
+        #[ink(message)]
+        pub fn submit_read_request(
+            &mut self,
+            letter_id: [u8; 32],
+            email_hash: [u8; 32],
+        ) -> Result<[u8; 32]> {
+            let caller = self.env().caller();
+            let request_id = Self::compute_request_id(&letter_id, &email_hash);
+
+            // Check for duplicate
+            if self.read_requests.get(request_id).is_some() {
+                return Err(Error::DuplicateRequest);
+            }
+
+            let record = ReadRequestRecord {
+                letter_id,
+                email_hash,
+                requester: caller,
+                status: RequestStatus::Pending,
+                submitted_at_block: u64::from(self.env().block_number()),
+                resolved_at_block: 0,
+                resolved_by: Address::default(),
+            };
+
+            self.read_requests.insert(request_id, &record);
+
+            self.env().emit_event(ReadRequestSubmitted {
+                request_id,
+                requester: caller,
+                letter_id,
+                email_hash,
+            });
+
+            Ok(request_id)
+        }
+
+        /// Approve a read request. Only admins can approve.
+        ///
+        /// Approving a request adds the email hash to the letter's dissem list,
+        /// granting read access. An optional `expires_at_block` of 0 means no expiry.
+        #[ink(message)]
+        pub fn approve_read_request(
+            &mut self,
+            request_id: [u8; 32],
+            expires_at_block: u64,
+        ) -> Result<()> {
+            if !self.caller_is_admin() {
+                return Err(Error::NotAdmin);
+            }
+
+            let mut record = self
+                .read_requests
+                .get(request_id)
+                .ok_or(Error::RequestNotFound)?;
+
+            if record.status != RequestStatus::Pending {
+                return Err(Error::RequestAlreadyProcessed);
+            }
+
+            let admin = self.env().caller();
+            let current_block = u64::from(self.env().block_number());
+
+            record.status = RequestStatus::Approved;
+            record.resolved_at_block = current_block;
+            record.resolved_by = admin;
+            self.read_requests.insert(request_id, &record);
+
+            // Add to dissem list
+            let dissem_key = Self::compute_dissem_key(&record.letter_id, &record.email_hash);
+            let entry = DissemEntry {
+                granted_at_block: current_block,
+                expires_at_block,
+                is_revoked: false,
+                granted_by: admin,
+            };
+            self.dissem_entries.insert(dissem_key, &entry);
+
+            self.env().emit_event(ReadRequestApproved {
+                request_id,
+                admin,
+                letter_id: record.letter_id,
+                email_hash: record.email_hash,
+            });
+
+            Ok(())
+        }
+
+        /// Deny a read request. Only admins can deny.
+        #[ink(message)]
+        pub fn deny_read_request(&mut self, request_id: [u8; 32]) -> Result<()> {
+            if !self.caller_is_admin() {
+                return Err(Error::NotAdmin);
+            }
+
+            let mut record = self
+                .read_requests
+                .get(request_id)
+                .ok_or(Error::RequestNotFound)?;
+
+            if record.status != RequestStatus::Pending {
+                return Err(Error::RequestAlreadyProcessed);
+            }
+
+            let admin = self.env().caller();
+
+            record.status = RequestStatus::Denied;
+            record.resolved_at_block = u64::from(self.env().block_number());
+            record.resolved_by = admin;
+            self.read_requests.insert(request_id, &record);
+
+            self.env().emit_event(ReadRequestDenied {
+                request_id,
+                admin,
+            });
+
+            Ok(())
+        }
+
+        /// Get a read request by its ID.
+        #[ink(message)]
+        pub fn get_read_request(&self, request_id: [u8; 32]) -> Option<ReadRequestRecord> {
+            self.read_requests.get(request_id)
+        }
+
+        // ──────────────────────────────────────────────────
+        // Letter Dissem List / Entitlement Checks
+        // ──────────────────────────────────────────────────
+
+        /// Check if an email hash is entitled to read a letter.
+        ///
+        /// Returns true if a non-revoked, non-expired dissem entry exists.
+        #[ink(message)]
+        pub fn check_letter_entitlement(
+            &self,
+            letter_id: [u8; 32],
+            email_hash: [u8; 32],
+        ) -> bool {
+            let dissem_key = Self::compute_dissem_key(&letter_id, &email_hash);
+            if let Some(entry) = self.dissem_entries.get(dissem_key) {
+                if entry.is_revoked {
+                    return false;
+                }
+                if entry.expires_at_block > 0
+                    && u64::from(self.env().block_number()) > entry.expires_at_block
+                {
+                    return false;
+                }
+                true
+            } else {
+                false
+            }
+        }
+
+        /// Get the dissem entry for a letter+email pair.
+        #[ink(message)]
+        pub fn get_dissem_entry(
+            &self,
+            letter_id: [u8; 32],
+            email_hash: [u8; 32],
+        ) -> Option<DissemEntry> {
+            let dissem_key = Self::compute_dissem_key(&letter_id, &email_hash);
+            self.dissem_entries.get(dissem_key)
+        }
+
+        /// Revoke a dissem entry (remove read access). Only admins can revoke.
+        #[ink(message)]
+        pub fn revoke_letter_entitlement(
+            &mut self,
+            letter_id: [u8; 32],
+            email_hash: [u8; 32],
+        ) -> Result<()> {
+            if !self.caller_is_admin() {
+                return Err(Error::NotAdmin);
+            }
+
+            let dissem_key = Self::compute_dissem_key(&letter_id, &email_hash);
+            let mut entry = self
+                .dissem_entries
+                .get(dissem_key)
+                .ok_or(Error::DissemEntryNotFound)?;
+
+            entry.is_revoked = true;
+            self.dissem_entries.insert(dissem_key, &entry);
+
+            self.env().emit_event(DissemEntryRevoked {
+                letter_id,
+                email_hash,
+            });
+
+            Ok(())
+        }
+
+        /// Manually add a dissem entry without a request. Only admins can do this.
+        #[ink(message)]
+        pub fn add_dissem_entry(
+            &mut self,
+            letter_id: [u8; 32],
+            email_hash: [u8; 32],
+            expires_at_block: u64,
+        ) -> Result<()> {
+            if !self.caller_is_admin() {
+                return Err(Error::NotAdmin);
+            }
+
+            let admin = self.env().caller();
+            let dissem_key = Self::compute_dissem_key(&letter_id, &email_hash);
+            let entry = DissemEntry {
+                granted_at_block: u64::from(self.env().block_number()),
+                expires_at_block,
+                is_revoked: false,
+                granted_by: admin,
+            };
+            self.dissem_entries.insert(dissem_key, &entry);
+
+            Ok(())
+        }
+
+        /// Compute a deterministic request ID from letter_id and email_hash.
+        fn compute_request_id(letter_id: &[u8; 32], email_hash: &[u8; 32]) -> [u8; 32] {
+            use ink::env::hash::{Blake2x256, HashOutput};
+
+            let mut input = [0u8; 64];
+            input[..32].copy_from_slice(letter_id);
+            input[32..].copy_from_slice(email_hash);
+
+            let mut output = <Blake2x256 as HashOutput>::Type::default();
+            ink::env::hash_bytes::<Blake2x256>(&input, &mut output);
+            output
+        }
+
+        /// Compute the dissem storage key from letter_id and email_hash.
+        fn compute_dissem_key(letter_id: &[u8; 32], email_hash: &[u8; 32]) -> [u8; 32] {
+            use ink::env::hash::{Blake2x256, HashOutput};
+
+            // Use a domain separator to avoid collision with request IDs
+            let mut input = ink::prelude::vec::Vec::with_capacity(72);
+            input.extend_from_slice(b"dissem::");
+            input.extend_from_slice(letter_id);
+            input.extend_from_slice(email_hash);
+
+            let mut output = <Blake2x256 as HashOutput>::Type::default();
+            ink::env::hash_bytes::<Blake2x256>(&input, &mut output);
+            output
         }
 
         /// Helper function to convert entitlement level to numeric value for comparison
@@ -843,6 +1259,335 @@ mod access_registry {
             );
 
             assert_eq!(result, Err(Error::MissingRequiredAttribute));
+        }
+
+        // ──────────────────────────────────────────────────
+        // Admin Management Tests
+        // ──────────────────────────────────────────────────
+
+        #[ink::test]
+        fn owner_is_admin_by_default() {
+            let contract = AccessRegistry::new();
+            let owner = contract.owner();
+            assert!(contract.is_admin_account(owner));
+        }
+
+        #[ink::test]
+        fn add_admin_works() {
+            let mut contract = AccessRegistry::new();
+            let admin = Address::from([0x02; 20]);
+
+            assert!(!contract.is_admin_account(admin));
+            assert!(contract.add_admin(admin).is_ok());
+            assert!(contract.is_admin_account(admin));
+        }
+
+        #[ink::test]
+        fn add_admin_fails_for_non_owner() {
+            let mut contract = AccessRegistry::new();
+            let admin = Address::from([0x02; 20]);
+
+            // Change caller to non-owner
+            ink::env::test::set_caller(admin);
+
+            assert_eq!(
+                contract.add_admin(Address::from([0x03; 20])),
+                Err(Error::NotOwner)
+            );
+        }
+
+        #[ink::test]
+        fn remove_admin_works() {
+            let mut contract = AccessRegistry::new();
+            let admin = Address::from([0x02; 20]);
+
+            contract.add_admin(admin).unwrap();
+            assert!(contract.is_admin_account(admin));
+
+            assert!(contract.remove_admin(admin).is_ok());
+            assert!(!contract.is_admin_account(admin));
+        }
+
+        // ──────────────────────────────────────────────────
+        // Read Request Tests
+        // ──────────────────────────────────────────────────
+
+        #[ink::test]
+        fn submit_read_request_works() {
+            let mut contract = AccessRegistry::new();
+            let letter_id = [0x01u8; 32];
+            let email_hash = [0x02u8; 32];
+
+            let result = contract.submit_read_request(letter_id, email_hash);
+            assert!(result.is_ok());
+
+            let request_id = result.unwrap();
+            let record = contract.get_read_request(request_id).unwrap();
+            assert_eq!(record.letter_id, letter_id);
+            assert_eq!(record.email_hash, email_hash);
+            assert_eq!(record.status, RequestStatus::Pending);
+            assert_eq!(record.resolved_at_block, 0);
+        }
+
+        #[ink::test]
+        fn submit_duplicate_request_fails() {
+            let mut contract = AccessRegistry::new();
+            let letter_id = [0x01u8; 32];
+            let email_hash = [0x02u8; 32];
+
+            contract.submit_read_request(letter_id, email_hash).unwrap();
+            let result = contract.submit_read_request(letter_id, email_hash);
+            assert_eq!(result, Err(Error::DuplicateRequest));
+        }
+
+        #[ink::test]
+        fn different_letter_email_pairs_get_different_ids() {
+            let mut contract = AccessRegistry::new();
+
+            let id1 = contract
+                .submit_read_request([0x01u8; 32], [0x02u8; 32])
+                .unwrap();
+            let id2 = contract
+                .submit_read_request([0x01u8; 32], [0x03u8; 32])
+                .unwrap();
+            let id3 = contract
+                .submit_read_request([0x04u8; 32], [0x02u8; 32])
+                .unwrap();
+
+            assert_ne!(id1, id2);
+            assert_ne!(id1, id3);
+            assert_ne!(id2, id3);
+        }
+
+        #[ink::test]
+        fn approve_read_request_works() {
+            let mut contract = AccessRegistry::new();
+            let letter_id = [0x01u8; 32];
+            let email_hash = [0x02u8; 32];
+
+            let request_id = contract
+                .submit_read_request(letter_id, email_hash)
+                .unwrap();
+
+            // Owner is admin by default, so approve should work
+            assert!(contract.approve_read_request(request_id, 0).is_ok());
+
+            let record = contract.get_read_request(request_id).unwrap();
+            assert_eq!(record.status, RequestStatus::Approved);
+            assert_eq!(record.resolved_by, contract.owner());
+
+            // Dissem entry should now exist
+            assert!(contract.check_letter_entitlement(letter_id, email_hash));
+        }
+
+        #[ink::test]
+        fn approve_request_fails_for_non_admin() {
+            let mut contract = AccessRegistry::new();
+            let letter_id = [0x01u8; 32];
+            let email_hash = [0x02u8; 32];
+
+            let request_id = contract
+                .submit_read_request(letter_id, email_hash)
+                .unwrap();
+
+            // Switch to non-admin caller
+            let non_admin = Address::from([0x99; 20]);
+            ink::env::test::set_caller(non_admin);
+
+            assert_eq!(
+                contract.approve_read_request(request_id, 0),
+                Err(Error::NotAdmin)
+            );
+        }
+
+        #[ink::test]
+        fn approve_nonexistent_request_fails() {
+            let mut contract = AccessRegistry::new();
+            assert_eq!(
+                contract.approve_read_request([0x99u8; 32], 0),
+                Err(Error::RequestNotFound)
+            );
+        }
+
+        #[ink::test]
+        fn approve_already_approved_request_fails() {
+            let mut contract = AccessRegistry::new();
+            let request_id = contract
+                .submit_read_request([0x01u8; 32], [0x02u8; 32])
+                .unwrap();
+
+            contract.approve_read_request(request_id, 0).unwrap();
+            assert_eq!(
+                contract.approve_read_request(request_id, 0),
+                Err(Error::RequestAlreadyProcessed)
+            );
+        }
+
+        #[ink::test]
+        fn deny_read_request_works() {
+            let mut contract = AccessRegistry::new();
+            let letter_id = [0x01u8; 32];
+            let email_hash = [0x02u8; 32];
+
+            let request_id = contract
+                .submit_read_request(letter_id, email_hash)
+                .unwrap();
+
+            assert!(contract.deny_read_request(request_id).is_ok());
+
+            let record = contract.get_read_request(request_id).unwrap();
+            assert_eq!(record.status, RequestStatus::Denied);
+
+            // Dissem entry should NOT exist
+            assert!(!contract.check_letter_entitlement(letter_id, email_hash));
+        }
+
+        #[ink::test]
+        fn deny_request_fails_for_non_admin() {
+            let mut contract = AccessRegistry::new();
+            let request_id = contract
+                .submit_read_request([0x01u8; 32], [0x02u8; 32])
+                .unwrap();
+
+            let non_admin = Address::from([0x99; 20]);
+            ink::env::test::set_caller(non_admin);
+
+            assert_eq!(
+                contract.deny_read_request(request_id),
+                Err(Error::NotAdmin)
+            );
+        }
+
+        #[ink::test]
+        fn deny_already_denied_request_fails() {
+            let mut contract = AccessRegistry::new();
+            let request_id = contract
+                .submit_read_request([0x01u8; 32], [0x02u8; 32])
+                .unwrap();
+
+            contract.deny_read_request(request_id).unwrap();
+            assert_eq!(
+                contract.deny_read_request(request_id),
+                Err(Error::RequestAlreadyProcessed)
+            );
+        }
+
+        #[ink::test]
+        fn cannot_approve_denied_request() {
+            let mut contract = AccessRegistry::new();
+            let request_id = contract
+                .submit_read_request([0x01u8; 32], [0x02u8; 32])
+                .unwrap();
+
+            contract.deny_read_request(request_id).unwrap();
+            assert_eq!(
+                contract.approve_read_request(request_id, 0),
+                Err(Error::RequestAlreadyProcessed)
+            );
+        }
+
+        // ──────────────────────────────────────────────────
+        // Dissem List / Letter Entitlement Tests
+        // ──────────────────────────────────────────────────
+
+        #[ink::test]
+        fn check_entitlement_returns_false_when_none() {
+            let contract = AccessRegistry::new();
+            assert!(!contract.check_letter_entitlement([0x01u8; 32], [0x02u8; 32]));
+        }
+
+        #[ink::test]
+        fn revoke_letter_entitlement_works() {
+            let mut contract = AccessRegistry::new();
+            let letter_id = [0x01u8; 32];
+            let email_hash = [0x02u8; 32];
+
+            // Approve to create dissem entry
+            let request_id = contract
+                .submit_read_request(letter_id, email_hash)
+                .unwrap();
+            contract.approve_read_request(request_id, 0).unwrap();
+            assert!(contract.check_letter_entitlement(letter_id, email_hash));
+
+            // Revoke
+            assert!(contract.revoke_letter_entitlement(letter_id, email_hash).is_ok());
+            assert!(!contract.check_letter_entitlement(letter_id, email_hash));
+
+            // Dissem entry still exists but is_revoked
+            let entry = contract.get_dissem_entry(letter_id, email_hash).unwrap();
+            assert!(entry.is_revoked);
+        }
+
+        #[ink::test]
+        fn revoke_nonexistent_entitlement_fails() {
+            let mut contract = AccessRegistry::new();
+            assert_eq!(
+                contract.revoke_letter_entitlement([0x01u8; 32], [0x02u8; 32]),
+                Err(Error::DissemEntryNotFound)
+            );
+        }
+
+        #[ink::test]
+        fn revoke_entitlement_fails_for_non_admin() {
+            let mut contract = AccessRegistry::new();
+            let letter_id = [0x01u8; 32];
+            let email_hash = [0x02u8; 32];
+
+            let request_id = contract
+                .submit_read_request(letter_id, email_hash)
+                .unwrap();
+            contract.approve_read_request(request_id, 0).unwrap();
+
+            let non_admin = Address::from([0x99; 20]);
+            ink::env::test::set_caller(non_admin);
+
+            assert_eq!(
+                contract.revoke_letter_entitlement(letter_id, email_hash),
+                Err(Error::NotAdmin)
+            );
+        }
+
+        #[ink::test]
+        fn add_dissem_entry_works() {
+            let mut contract = AccessRegistry::new();
+            let letter_id = [0x01u8; 32];
+            let email_hash = [0x02u8; 32];
+
+            assert!(contract.add_dissem_entry(letter_id, email_hash, 0).is_ok());
+            assert!(contract.check_letter_entitlement(letter_id, email_hash));
+        }
+
+        #[ink::test]
+        fn add_dissem_entry_fails_for_non_admin() {
+            let mut contract = AccessRegistry::new();
+            let non_admin = Address::from([0x99; 20]);
+            ink::env::test::set_caller(non_admin);
+
+            assert_eq!(
+                contract.add_dissem_entry([0x01u8; 32], [0x02u8; 32], 0),
+                Err(Error::NotAdmin)
+            );
+        }
+
+        #[ink::test]
+        fn added_admin_can_approve_requests() {
+            let mut contract = AccessRegistry::new();
+            let admin2 = Address::from([0x02; 20]);
+            contract.add_admin(admin2).unwrap();
+
+            let request_id = contract
+                .submit_read_request([0x01u8; 32], [0x02u8; 32])
+                .unwrap();
+
+            // Switch to admin2
+            ink::env::test::set_caller(admin2);
+            assert!(contract.approve_read_request(request_id, 0).is_ok());
+        }
+
+        #[ink::test]
+        fn get_read_request_returns_none_for_unknown() {
+            let contract = AccessRegistry::new();
+            assert!(contract.get_read_request([0x99u8; 32]).is_none());
         }
     }
 }
