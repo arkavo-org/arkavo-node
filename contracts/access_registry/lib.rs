@@ -22,6 +22,8 @@ mod access_registry {
         entitlements: Mapping<Address, EntitlementLevel>,
         /// Contract owner who can grant/revoke entitlements
         owner: Address,
+        /// Addresses authorized to call grant/revoke (e.g. payment_integration contract)
+        authorized_grantors: Mapping<Address, bool>,
     }
 
     /// Events emitted by the contract
@@ -38,12 +40,26 @@ mod access_registry {
         account: Address,
     }
 
+    #[ink(event)]
+    pub struct GrantorAuthorized {
+        #[ink(topic)]
+        grantor: Address,
+    }
+
+    #[ink(event)]
+    pub struct GrantorRevoked {
+        #[ink(topic)]
+        grantor: Address,
+    }
+
     /// Errors that can occur during contract execution
     #[derive(Debug, PartialEq, Eq, Clone, scale::Encode, scale::Decode)]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub enum Error {
         /// Caller is not the owner
         NotOwner,
+        /// Caller is not authorized (not owner and not an authorized grantor)
+        NotAuthorized,
         /// Entitlement not found
         EntitlementNotFound,
     }
@@ -63,18 +79,19 @@ mod access_registry {
             Self {
                 entitlements: Mapping::default(),
                 owner: Self::env().caller(),
+                authorized_grantors: Mapping::default(),
             }
         }
 
-        /// Grant an entitlement to an account
+        /// Grant an entitlement to an account (owner or authorized grantor)
         #[ink(message)]
         pub fn grant_entitlement(
             &mut self,
             account: Address,
             level: EntitlementLevel,
         ) -> Result<()> {
-            if self.env().caller() != self.owner {
-                return Err(Error::NotOwner);
+            if !self.is_authorized_caller() {
+                return Err(Error::NotAuthorized);
             }
 
             self.entitlements.insert(account, &level);
@@ -87,11 +104,11 @@ mod access_registry {
             Ok(())
         }
 
-        /// Revoke an entitlement from an account
+        /// Revoke an entitlement from an account (owner or authorized grantor)
         #[ink(message)]
         pub fn revoke_entitlement(&mut self, account: Address) -> Result<()> {
-            if self.env().caller() != self.owner {
-                return Err(Error::NotOwner);
+            if !self.is_authorized_caller() {
+                return Err(Error::NotAuthorized);
             }
 
             self.entitlements.remove(account);
@@ -99,6 +116,34 @@ mod access_registry {
             self.env().emit_event(EntitlementRevoked { account });
 
             Ok(())
+        }
+
+        /// Authorize an address to call grant/revoke (owner only)
+        #[ink(message)]
+        pub fn authorize_grantor(&mut self, grantor: Address) -> Result<()> {
+            if self.env().caller() != self.owner {
+                return Err(Error::NotOwner);
+            }
+            self.authorized_grantors.insert(grantor, &true);
+            self.env().emit_event(GrantorAuthorized { grantor });
+            Ok(())
+        }
+
+        /// Revoke an authorized grantor (owner only)
+        #[ink(message)]
+        pub fn revoke_grantor(&mut self, grantor: Address) -> Result<()> {
+            if self.env().caller() != self.owner {
+                return Err(Error::NotOwner);
+            }
+            self.authorized_grantors.remove(grantor);
+            self.env().emit_event(GrantorRevoked { grantor });
+            Ok(())
+        }
+
+        /// Check if an address is an authorized grantor
+        #[ink(message)]
+        pub fn is_authorized_grantor(&self, account: Address) -> bool {
+            self.authorized_grantors.get(account).unwrap_or(false)
         }
 
         /// Check the entitlement level of an account
@@ -122,6 +167,12 @@ mod access_registry {
         #[ink(message)]
         pub fn owner(&self) -> Address {
             self.owner
+        }
+
+        /// Check if the caller is the owner or an authorized grantor
+        fn is_authorized_caller(&self) -> bool {
+            let caller = self.env().caller();
+            caller == self.owner || self.authorized_grantors.get(caller).unwrap_or(false)
         }
 
         /// Helper function to convert entitlement level to numeric value for comparison
@@ -181,6 +232,26 @@ mod access_registry {
                 .unwrap();
             assert!(contract.revoke_entitlement(account).is_ok());
             assert_eq!(contract.get_entitlement(account), EntitlementLevel::None);
+        }
+
+        #[ink::test]
+        fn authorize_grantor_works() {
+            let mut contract = AccessRegistry::new();
+            let grantor = Address::from([0x03; 20]);
+
+            assert!(!contract.is_authorized_grantor(grantor));
+            assert!(contract.authorize_grantor(grantor).is_ok());
+            assert!(contract.is_authorized_grantor(grantor));
+        }
+
+        #[ink::test]
+        fn revoke_grantor_works() {
+            let mut contract = AccessRegistry::new();
+            let grantor = Address::from([0x03; 20]);
+
+            contract.authorize_grantor(grantor).unwrap();
+            assert!(contract.revoke_grantor(grantor).is_ok());
+            assert!(!contract.is_authorized_grantor(grantor));
         }
     }
 }

@@ -15,6 +15,7 @@ use sp_block_builder::BlockBuilder;
 use sp_blockchain::{Error as BlockChainError, HeaderBackend, HeaderMetadata};
 
 pub use auth_api::AuthApiServer;
+pub use pdp_api::PdpApiServer;
 
 /// Authentication API module for DID-to-account linking
 /// Note: This is a secured backchannel RPC - no token verification needed
@@ -114,7 +115,7 @@ mod auth_api {
     }
 
     /// Parse H160 address from hex string (0x-prefixed)
-    fn parse_h160(address: &str) -> Result<H160, String> {
+    pub(super) fn parse_h160(address: &str) -> Result<H160, String> {
         if !address.starts_with("0x") || address.len() != 42 {
             return Err("Invalid address format: must be 0x-prefixed 20-byte hex".to_string());
         }
@@ -519,6 +520,293 @@ mod auth_api {
     }
 }
 
+/// PDP (Policy Decision Point) API module for access evaluation
+/// Calls policy_engine contract to evaluate access decisions
+mod pdp_api {
+    use super::*;
+    use jsonrpsee::{core::RpcResult, proc_macros::rpc};
+    use pallet_revive::{H160, ReviveApi};
+    use serde::{Deserialize, Serialize};
+
+    /// Result of an access evaluation
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct AccessDecision {
+        /// Whether access is granted
+        pub granted: bool,
+        /// The resource that was evaluated
+        pub resource_id: String,
+        /// The subject that was evaluated
+        pub subject_address: String,
+        /// Error message (if evaluation failed)
+        pub error: Option<String>,
+        /// Error code for programmatic handling
+        pub error_code: Option<String>,
+    }
+
+    /// Configuration for the policy engine contract
+    #[derive(Clone)]
+    pub struct PolicyEngineConfig {
+        /// The deployed policy_engine contract address (H160)
+        pub contract_address: H160,
+        /// The account used for dry-run calls (any funded account)
+        pub caller_account: AccountId,
+    }
+
+    /// PDP RPC API for access evaluation
+    #[rpc(server, client, namespace = "arkavo")]
+    pub trait PdpApi {
+        /// Evaluate whether a subject has access to a resource
+        ///
+        /// Calls policy_engine.evaluate_access_by_resource(subject, resource_id)
+        /// via a dry-run (read-only) contract call.
+        ///
+        /// # Arguments
+        /// * `subject_address` - EVM-compatible address (0x-prefixed, 20 bytes hex)
+        /// * `resource_id` - The resource identifier (e.g. letter UUID)
+        #[method(name = "evaluateAccess")]
+        fn evaluate_access(
+            &self,
+            subject_address: String,
+            resource_id: String,
+        ) -> RpcResult<AccessDecision>;
+    }
+
+    /// Implementation of the PDP API
+    pub struct PdpApiImpl<C> {
+        /// Substrate client for runtime API calls
+        client: Arc<C>,
+        /// Optional policy engine configuration
+        config: Option<PolicyEngineConfig>,
+    }
+
+    impl<C> PdpApiImpl<C> {
+        /// Create a new PDP API instance
+        pub fn new(client: Arc<C>, config: Option<PolicyEngineConfig>) -> Self {
+            Self { client, config }
+        }
+    }
+
+    /// Encode ink! contract call for `evaluate_access_by_resource(account: Address, resource_id: String)`
+    ///
+    /// Selector: blake2b_256(b"evaluate_access_by_resource")[0..4] = [0x5a, 0x61, 0xbf, 0x00]
+    fn encode_evaluate_access_by_resource(account: H160, resource_id: &str) -> Vec<u8> {
+        use parity_scale_codec::Encode;
+
+        let selector: [u8; 4] = [0x5a, 0x61, 0xbf, 0x00];
+
+        let mut encoded = selector.to_vec();
+        encoded.extend(account.encode());
+        encoded.extend(resource_id.encode());
+
+        encoded
+    }
+
+    impl<C> PdpApiServer for PdpApiImpl<C>
+    where
+        C: ProvideRuntimeApi<Block>,
+        C: HeaderBackend<Block> + 'static,
+        C: Send + Sync + 'static,
+        C::Api: pallet_revive::ReviveApi<Block, AccountId, Balance, Nonce, u32>,
+    {
+        fn evaluate_access(
+            &self,
+            subject_address: String,
+            resource_id: String,
+        ) -> RpcResult<AccessDecision> {
+            // Parse subject address
+            let subject_h160 = match auth_api::parse_h160(&subject_address) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    return Ok(AccessDecision {
+                        granted: false,
+                        resource_id,
+                        subject_address,
+                        error: Some(e),
+                        error_code: Some("INVALID_ADDRESS".to_string()),
+                    });
+                }
+            };
+
+            // Check configuration
+            let Some(config) = &self.config else {
+                log::warn!(
+                    "PDP evaluation requested but POLICY_ENGINE_ADDRESS not configured. \
+                     subject={}, resource={}",
+                    subject_address,
+                    resource_id
+                );
+                return Ok(AccessDecision {
+                    granted: false,
+                    resource_id,
+                    subject_address,
+                    error: Some(
+                        "Policy engine contract not configured. Set POLICY_ENGINE_ADDRESS and POLICY_ENGINE_CALLER environment variables.".to_string()
+                    ),
+                    error_code: Some("CONTRACT_NOT_CONFIGURED".to_string()),
+                });
+            };
+
+            // Encode the contract call
+            let input_data = encode_evaluate_access_by_resource(subject_h160, &resource_id);
+
+            // Get the best block hash
+            let at = self.client.info().best_hash;
+
+            // Dry-run call via runtime API (read-only, no state changes)
+            let result = self.client.runtime_api().call(
+                at,
+                config.caller_account.clone(),
+                config.contract_address,
+                0,    // No value transfer
+                None, // Default gas limit
+                None, // Default storage deposit limit
+                input_data,
+            );
+
+            match result {
+                Ok(contract_result) => {
+                    match contract_result.result {
+                        Ok(exec_result) => {
+                            if exec_result.flags.is_empty() {
+                                // Decode bool from return data
+                                // SCALE bool: 0x00 = false, 0x01 = true
+                                let granted = exec_result.data.first().is_some_and(|&b| b == 0x01);
+
+                                log::info!(
+                                    "PDP evaluation: subject={}, resource={}, granted={}",
+                                    subject_address,
+                                    resource_id,
+                                    granted
+                                );
+
+                                Ok(AccessDecision {
+                                    granted,
+                                    resource_id,
+                                    subject_address,
+                                    error: None,
+                                    error_code: None,
+                                })
+                            } else {
+                                log::error!(
+                                    "PDP contract call returned error flags: subject={}, resource={}",
+                                    subject_address,
+                                    resource_id
+                                );
+                                Ok(AccessDecision {
+                                    granted: false,
+                                    resource_id,
+                                    subject_address,
+                                    error: Some("Contract returned error".to_string()),
+                                    error_code: Some("CONTRACT_ERROR".to_string()),
+                                })
+                            }
+                        }
+                        Err(error) => {
+                            log::error!(
+                                "PDP contract execution failed: subject={}, resource={}, error={:?}",
+                                subject_address,
+                                resource_id,
+                                error
+                            );
+                            Ok(AccessDecision {
+                                granted: false,
+                                resource_id,
+                                subject_address,
+                                error: Some(format!("Contract execution failed: {:?}", error)),
+                                error_code: Some("CONTRACT_EXECUTION_FAILED".to_string()),
+                            })
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!(
+                        "PDP runtime API call failed: subject={}, resource={}, error={}",
+                        subject_address,
+                        resource_id,
+                        e
+                    );
+                    Ok(AccessDecision {
+                        granted: false,
+                        resource_id,
+                        subject_address,
+                        error: Some(format!("Runtime API error: {}", e)),
+                        error_code: Some("RUNTIME_ERROR".to_string()),
+                    })
+                }
+            }
+        }
+    }
+
+    /// Load policy engine configuration from environment
+    pub fn load_config_from_env() -> Option<PolicyEngineConfig> {
+        let contract_address_str = std::env::var("POLICY_ENGINE_ADDRESS").ok()?;
+        let caller_account_str = std::env::var("POLICY_ENGINE_CALLER").ok()?;
+
+        let contract_address = match auth_api::parse_h160(&contract_address_str) {
+            Ok(addr) => addr,
+            Err(e) => {
+                log::error!("Invalid POLICY_ENGINE_ADDRESS: {}", e);
+                return None;
+            }
+        };
+
+        use sp_core::crypto::Ss58Codec;
+        let caller_account = match AccountId::from_ss58check(&caller_account_str) {
+            Ok(account) => account,
+            Err(e) => {
+                log::error!(
+                    "Invalid POLICY_ENGINE_CALLER (expected SS58 format): {:?}",
+                    e
+                );
+                return None;
+            }
+        };
+
+        log::info!(
+            "Policy engine configured: contract={}, caller={}",
+            contract_address_str,
+            caller_account_str
+        );
+
+        Some(PolicyEngineConfig {
+            contract_address,
+            caller_account,
+        })
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn encode_evaluate_access_by_resource_produces_correct_selector() {
+            let account = H160::from([0x12; 20]);
+            let resource_id = "letter-abc-123";
+
+            let encoded = encode_evaluate_access_by_resource(account, resource_id);
+
+            // Selector for "evaluate_access_by_resource"
+            assert_eq!(&encoded[0..4], &[0x5a, 0x61, 0xbf, 0x00]);
+        }
+
+        #[test]
+        fn encode_evaluate_access_by_resource_includes_args() {
+            let account = H160::from([0xAB; 20]);
+            let resource_id = "test";
+
+            let encoded = encode_evaluate_access_by_resource(account, resource_id);
+
+            // After 4-byte selector: 20-byte address
+            assert_eq!(&encoded[4..24], &[0xAB; 20]);
+
+            // Then SCALE-encoded string: compact length (4 << 2 = 16 = 0x10) + "test"
+            assert_eq!(encoded[24], 0x10);
+            assert_eq!(&encoded[25..29], b"test");
+        }
+    }
+}
+
 /// Full client dependencies.
 pub struct FullDeps<C, P> {
     /// The client instance to use.
@@ -554,8 +842,13 @@ where
     let user_registry_config = auth_api::load_config_from_env();
 
     // Add AuthnZ API for DID account linking (secured backchannel)
-    let auth_api = auth_api::AuthApiImpl::new(client, user_registry_config);
+    let auth_api = auth_api::AuthApiImpl::new(client.clone(), user_registry_config);
     module.merge(auth_api.into_rpc())?;
+
+    // Load policy engine config from environment and add PDP API
+    let pdp_config = pdp_api::load_config_from_env();
+    let pdp = pdp_api::PdpApiImpl::new(client, pdp_config);
+    module.merge(pdp.into_rpc())?;
 
     Ok(module)
 }

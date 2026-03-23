@@ -4,6 +4,12 @@
 mod payment_integration {
     use ink::prelude::string::String;
     use ink::storage::Mapping;
+    use ink::U256;
+
+    /// Ink! selector for `access_registry.grant_entitlement(account, level)`
+    const SELECTOR_GRANT_ENTITLEMENT: [u8; 4] = [0x92, 0xc8, 0x86, 0x85];
+    /// Ink! selector for `access_registry.revoke_entitlement(account)`
+    const SELECTOR_REVOKE_ENTITLEMENT: [u8; 4] = [0x98, 0xe0, 0x92, 0x85];
 
     /// Maximum length for string inputs (`payment_provider`, `transaction_id`)
     const MAX_STRING_LENGTH: usize = 256;
@@ -104,6 +110,8 @@ mod payment_integration {
         InvalidStatus,
         /// Input string exceeds maximum length
         InputTooLong,
+        /// Cross-contract call to access_registry failed
+        CrossContractCallFailed,
     }
 
     pub type Result<T> = core::result::Result<T, Error>;
@@ -208,8 +216,7 @@ mod payment_integration {
             Ok(payment_id)
         }
 
-        /// Complete a payment and grant entitlement
-        /// In a real implementation, this would call the `access_registry` contract
+        /// Complete a payment and grant entitlement via access_registry
         #[ink(message)]
         pub fn complete_payment(&mut self, payment_id: u32) -> Result<()> {
             if !self.is_authorized_processor(self.env().caller()) {
@@ -222,11 +229,21 @@ mod payment_integration {
                 return Err(Error::InvalidStatus);
             }
 
+            // Grant entitlement via access_registry cross-contract call
+            if self.access_registry.is_some()
+                && !self.call_grant_entitlement(payment.account, payment.entitlement_granted)
+            {
+                payment.status = PaymentStatus::Failed;
+                self.payments.insert(payment_id, &payment);
+                self.env().emit_event(PaymentFailed {
+                    payment_id,
+                    reason: String::from("Failed to grant entitlement"),
+                });
+                return Err(Error::CrossContractCallFailed);
+            }
+
             payment.status = PaymentStatus::Completed;
             self.payments.insert(payment_id, &payment);
-
-            // In a full implementation, this would call access_registry.grant_entitlement()
-            // For now, we just emit an event
 
             self.env().emit_event(PaymentCompleted {
                 payment_id,
@@ -254,7 +271,7 @@ mod payment_integration {
             Ok(())
         }
 
-        /// Refund a payment
+        /// Refund a payment and revoke entitlement via access_registry
         #[ink(message)]
         pub fn refund_payment(&mut self, payment_id: u32) -> Result<()> {
             if !self.is_authorized_processor(self.env().caller()) {
@@ -267,10 +284,19 @@ mod payment_integration {
                 return Err(Error::InvalidStatus);
             }
 
+            // Revoke entitlement via access_registry cross-contract call
+            if self.access_registry.is_some()
+                && !self.call_revoke_entitlement(payment.account)
+            {
+                self.env().emit_event(PaymentFailed {
+                    payment_id,
+                    reason: String::from("Failed to revoke entitlement"),
+                });
+                return Err(Error::CrossContractCallFailed);
+            }
+
             payment.status = PaymentStatus::Refunded;
             self.payments.insert(payment_id, &payment);
-
-            // In a full implementation, this would call access_registry.revoke_entitlement()
 
             self.env().emit_event(PaymentRefunded { payment_id });
 
@@ -305,6 +331,51 @@ mod payment_integration {
         #[ink(message)]
         pub fn next_payment_id(&self) -> u32 {
             self.next_payment_id
+        }
+
+        // --- Cross-contract call helpers ---
+
+        /// Call access_registry.grant_entitlement(account, level)
+        fn call_grant_entitlement(&self, account: Address, level: u8) -> bool {
+            let Some(registry_addr) = self.access_registry else {
+                return false;
+            };
+
+            let result = ink::env::call::build_call::<ink::env::DefaultEnvironment>()
+                .call(registry_addr)
+                .transferred_value(U256::from(0))
+                .exec_input(
+                    ink::env::call::ExecutionInput::new(
+                        ink::env::call::Selector::new(SELECTOR_GRANT_ENTITLEMENT),
+                    )
+                    .push_arg(account)
+                    .push_arg(level),
+                )
+                .returns::<()>()
+                .try_invoke();
+
+            matches!(result, Ok(Ok(())))
+        }
+
+        /// Call access_registry.revoke_entitlement(account)
+        fn call_revoke_entitlement(&self, account: Address) -> bool {
+            let Some(registry_addr) = self.access_registry else {
+                return false;
+            };
+
+            let result = ink::env::call::build_call::<ink::env::DefaultEnvironment>()
+                .call(registry_addr)
+                .transferred_value(U256::from(0))
+                .exec_input(
+                    ink::env::call::ExecutionInput::new(
+                        ink::env::call::Selector::new(SELECTOR_REVOKE_ENTITLEMENT),
+                    )
+                    .push_arg(account),
+                )
+                .returns::<()>()
+                .try_invoke();
+
+            matches!(result, Ok(Ok(())))
         }
     }
 
@@ -393,6 +464,26 @@ mod payment_integration {
 
             assert!(contract.authorize_processor(processor).is_ok());
             assert!(contract.is_authorized_processor(processor));
+        }
+
+        #[ink::test]
+        fn selector_grant_entitlement_is_correct() {
+            let mut output = [0u8; 32];
+            ink::env::hash_bytes::<ink::env::hash::Blake2x256>(
+                b"grant_entitlement",
+                &mut output,
+            );
+            assert_eq!(&output[0..4], &SELECTOR_GRANT_ENTITLEMENT);
+        }
+
+        #[ink::test]
+        fn selector_revoke_entitlement_is_correct() {
+            let mut output = [0u8; 32];
+            ink::env::hash_bytes::<ink::env::hash::Blake2x256>(
+                b"revoke_entitlement",
+                &mut output,
+            );
+            assert_eq!(&output[0..4], &SELECTOR_REVOKE_ENTITLEMENT);
         }
     }
 }
